@@ -152,6 +152,60 @@ async fn handle_standard_json_error_body(
     )
 }
 
+async fn handle_false_sse_responses_error(
+    State(state): State<UpstreamState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    record_upstream_request(&state, &headers, body).await;
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "text/event-stream")],
+        Body::from(
+            r#"{"error":{"message":"max_tool_calls is unsupported","type":"invalid_request_error"}}"#,
+        ),
+    )
+}
+
+async fn handle_json_responses_exceeding_max_uses(
+    State(state): State<UpstreamState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let response_status = if body
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.ends_with("-incomplete"))
+    {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    record_upstream_request(&state, &headers, body).await;
+    Json(json!({
+        "id": "resp_too_many_searches",
+        "model": "gpt-5.6-sol",
+        "status": response_status,
+        "incomplete_details": (response_status == "incomplete")
+            .then(|| json!({"reason": "max_output_tokens"})),
+        "output": [
+            {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": "one", "sources": []}
+            },
+            {
+                "id": "ws_2",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": "two", "sources": []}
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 2}
+    }))
+}
+
 async fn handle_plain_text_error_body(
     State(state): State<UpstreamState>,
     headers: HeaderMap,
@@ -1506,4 +1560,181 @@ async fn proxy_claude_streaming_runtime_disabled_rectifier_does_not_retry_matchi
         service.stop().await.expect("stop proxy service");
         upstream_handle.abort();
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn web_search_http_400_false_sse_is_handled_before_sse_parsing() {
+    let upstream_state = UpstreamState::default();
+    let upstream_router = Router::new()
+        .route("/v1/responses", post(handle_false_sse_responses_error))
+        .with_state(upstream_state.clone());
+    let upstream_listener = bind_test_listener().await;
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_router).await;
+    });
+
+    let db = Arc::new(Database::memory().expect("create memory database"));
+    let provider = Provider {
+        id: "claude-web-search-false-sse-error".to_string(),
+        name: "Claude WebSearch False SSE Error".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://{}", upstream_addr),
+                "ANTHROPIC_API_KEY": "sk-test-claude"
+            }
+        }),
+        website_url: None,
+        category: Some("claude".to_string()),
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..ProviderMeta::default()
+        }),
+        icon: None,
+        icon_color: None,
+        in_failover_queue: true,
+    };
+    db.save_provider("claude", &provider).unwrap();
+    db.set_current_provider("claude", &provider.id).unwrap();
+    set_claude_proxy_port_to_ephemeral(&db).await;
+    let service = ProxyService::new(db);
+    let mut config = service.get_config().await.unwrap();
+    config.listen_port = 0;
+    let proxy = service.start_with_runtime_config(config).await.unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}:{}/v1/messages",
+            proxy.address, proxy.port
+        ))
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "messages": [{"role":"user","content":"search"}],
+            "tools": [{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "max_uses":1
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "max_tool_calls is unsupported");
+
+    service.stop().await.unwrap();
+    upstream_handle.abort();
+}
+
+async fn assert_json_web_search_max_uses_is_enforced(stream: bool, incomplete: bool) {
+    let upstream_state = UpstreamState::default();
+    let upstream_router = Router::new()
+        .route(
+            "/v1/responses",
+            post(handle_json_responses_exceeding_max_uses),
+        )
+        .with_state(upstream_state);
+    let upstream_listener = bind_test_listener().await;
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_router).await;
+    });
+
+    let db = Arc::new(Database::memory().expect("create memory database"));
+    let provider = Provider {
+        id: format!("claude-web-search-json-max-{stream}"),
+        name: "Claude WebSearch JSON Max Uses".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://{}", upstream_addr),
+                "ANTHROPIC_API_KEY": "sk-test-claude"
+            }
+        }),
+        website_url: None,
+        category: Some("claude".to_string()),
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..ProviderMeta::default()
+        }),
+        icon: None,
+        icon_color: None,
+        in_failover_queue: true,
+    };
+    db.save_provider("claude", &provider).unwrap();
+    db.set_current_provider("claude", &provider.id).unwrap();
+    set_claude_proxy_port_to_ephemeral(&db).await;
+    let service = ProxyService::new(db);
+    let mut config = service.get_config().await.unwrap();
+    config.listen_port = 0;
+    let proxy = service.start_with_runtime_config(config).await.unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}:{}/v1/messages",
+            proxy.address, proxy.port
+        ))
+        .json(&json!({
+            "model": if incomplete { "gpt-5.6-sol-incomplete" } else { "gpt-5.6-sol" },
+            "stream": stream,
+            "messages": [{"role": "user", "content": "Search twice"}],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 1
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("WebSearch max_uses exceeded"));
+
+    service.stop().await.unwrap();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn web_search_non_stream_json_enforces_max_uses() {
+    assert_json_web_search_max_uses_is_enforced(false, false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn web_search_stream_json_fallback_enforces_max_uses() {
+    assert_json_web_search_max_uses_is_enforced(true, false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn web_search_non_stream_incomplete_json_enforces_max_uses() {
+    assert_json_web_search_max_uses_is_enforced(false, true).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn web_search_stream_incomplete_json_fallback_enforces_max_uses() {
+    assert_json_web_search_max_uses_is_enforced(true, true).await;
 }

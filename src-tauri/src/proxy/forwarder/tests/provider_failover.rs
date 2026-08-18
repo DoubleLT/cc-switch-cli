@@ -927,7 +927,7 @@ async fn responses_json_2xx_failure_fails_over_before_provider_commit() {
         .expect("2xx semantic failure should fail over");
 
     assert_eq!(result.provider.id, "p2");
-    assert_eq!(primary_hits.count.load(Ordering::SeqCst), 1);
+    assert_eq!(primary_hits.count.load(Ordering::SeqCst), 2);
     assert_eq!(secondary_hits.count.load(Ordering::SeqCst), 1);
 
     primary_server.abort();
@@ -1068,7 +1068,7 @@ async fn responses_sse_failure_before_output_fails_over_and_replays_fallback() {
         .collect::<Vec<_>>()
         .await;
     assert_eq!(chunks.concat().as_slice(), fallback_sse.as_bytes());
-    assert_eq!(primary_hits.count.load(Ordering::SeqCst), 1);
+    assert_eq!(primary_hits.count.load(Ordering::SeqCst), 2);
     assert_eq!(secondary_hits.count.load(Ordering::SeqCst), 1);
 
     primary_server.abort();

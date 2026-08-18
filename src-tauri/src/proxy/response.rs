@@ -30,6 +30,7 @@ use super::{
         streaming_responses::create_anthropic_sse_stream_from_responses,
         transform_codex_anthropic, transform_codex_chat,
         transform_gemini::AnthropicToolSchemaHints,
+        web_search_bridge::{create_buffered_anthropic_sse_stream, WebSearchRequestPolicy},
     },
 };
 
@@ -320,6 +321,7 @@ pub fn build_anthropic_stream_response(
     provider_id: Option<String>,
     session_id: Option<String>,
     tool_schema_hints: Option<AnthropicToolSchemaHints>,
+    web_search_policy: Option<WebSearchRequestPolicy>,
 ) -> Result<PreparedResponse, ProxyError> {
     let status = response.status();
     let headers = response.headers().clone();
@@ -336,10 +338,17 @@ pub fn build_anthropic_stream_response(
     let stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
     > = match api_format {
-        "openai_responses" => Box::pin(create_anthropic_sse_stream_from_responses(
-            timed_stream,
-            stream_completion.clone(),
-        )),
+        "openai_responses" => match web_search_policy {
+            Some(policy) => Box::pin(create_buffered_anthropic_sse_stream(
+                timed_stream,
+                stream_completion.clone(),
+                policy,
+            )),
+            None => Box::pin(create_anthropic_sse_stream_from_responses(
+                timed_stream,
+                stream_completion.clone(),
+            )),
+        },
         "gemini_native" => Box::pin(create_anthropic_sse_stream_from_gemini(
             timed_stream,
             Some(stream_completion.clone()),
@@ -782,7 +791,8 @@ fn copy_headers(
             || connection_listed_headers
                 .iter()
                 .any(|listed| listed == &lower)
-            || (strip_rebuilt_entity_headers && lower == "content-encoding")
+            || (strip_rebuilt_entity_headers
+                && matches!(lower.as_str(), "content-encoding" | "content-type"))
         {
             continue;
         }

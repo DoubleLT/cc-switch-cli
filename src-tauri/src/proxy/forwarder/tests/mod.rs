@@ -15,6 +15,7 @@ use axum::{
     routing::any,
     Json, Router,
 };
+use bytes::Bytes;
 use serde_json::{json, Value};
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -56,6 +57,8 @@ struct DelayedScriptedUpstream {
 enum ScriptedStreamingBody {
     Json(Value),
     Sse(&'static str),
+    OwnedSse(String),
+    Chunks(Vec<Bytes>),
 }
 
 #[derive(Clone)]
@@ -211,6 +214,18 @@ async fn handle_scripted_streaming_upstream(
             .header("content-type", "text/event-stream")
             .body(Body::from(body))
             .expect("build scripted streaming response"),
+        ScriptedStreamingBody::OwnedSse(body) => Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(body))
+            .expect("build scripted streaming response"),
+        ScriptedStreamingBody::Chunks(chunks) => Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(futures::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            )))
+            .expect("build chunked streaming response"),
     }
 }
 
@@ -263,6 +278,18 @@ async fn handle_delayed_scripted_streaming_upstream(
             .header("content-type", "text/event-stream")
             .body(Body::from(body))
             .expect("build delayed scripted streaming response"),
+        ScriptedStreamingBody::OwnedSse(body) => Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(body))
+            .expect("build delayed scripted streaming response"),
+        ScriptedStreamingBody::Chunks(chunks) => Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(futures::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            )))
+            .expect("build delayed chunked streaming response"),
     }
 }
 

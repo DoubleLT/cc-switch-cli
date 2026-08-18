@@ -4,8 +4,9 @@ use serde_json::{json, Value};
 use crate::{provider::Provider, proxy::error::ProxyError};
 
 use super::{
-    gemini_shadow::GeminiShadowStore, transform_gemini::AnthropicToolSchemaHints, AuthInfo,
-    AuthStrategy, ProviderAdapter, ProviderType,
+    gemini_shadow::GeminiShadowStore, transform_gemini::AnthropicToolSchemaHints,
+    web_search_bridge::WebSearchRequestPolicy, AuthInfo, AuthStrategy, ProviderAdapter,
+    ProviderType,
 };
 
 pub struct ClaudeAdapter;
@@ -285,6 +286,37 @@ pub fn transform_claude_request_for_api_format_with_shadow(
 impl ClaudeAdapter {
     pub fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn transform_response_with_web_search(
+        &self,
+        body: Value,
+        policy: Option<&WebSearchRequestPolicy>,
+    ) -> Result<Value, ProxyError> {
+        if let Some(policy) = policy {
+            let response_status = body.get("status").and_then(Value::as_str);
+            let is_responses_body = body.get("output").is_some()
+                || matches!(
+                    response_status,
+                    Some("completed" | "incomplete" | "failed" | "cancelled")
+                );
+            if is_responses_body {
+                if response_status == Some("failed")
+                    || body.get("error").is_some_and(|error| !error.is_null())
+                {
+                    return Ok(openai_error_to_anthropic(body));
+                }
+                policy.validate_buffered_response(&body)?;
+                if response_status != Some("completed") {
+                    return Err(ProxyError::TransformError(format!(
+                        "upstream WebSearch response ended with status {}",
+                        response_status.unwrap_or("unknown")
+                    )));
+                }
+                return super::transform_responses::responses_to_anthropic_web_search(body);
+            }
+        }
+        ProviderAdapter::transform_response(self, body)
     }
 
     pub fn provider_type(&self, provider: &Provider) -> ProviderType {
@@ -660,9 +692,10 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn transform_response(&self, body: serde_json::Value) -> Result<serde_json::Value, ProxyError> {
-        if body.get("error").is_some()
-            && body.get("choices").is_none()
-            && body.get("output").is_none()
+        if body.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+            || (body.get("error").is_some()
+                && body.get("choices").is_none()
+                && body.get("output").is_none())
         {
             return Ok(openai_error_to_anthropic(body));
         }
@@ -1342,6 +1375,66 @@ mod tests {
     }
 
     #[test]
+    fn official_openai_api_key_responses_does_not_mis_map_web_search_max_uses() {
+        let provider: Provider = serde_json::from_value(json!({
+            "id": "openai-api-key",
+            "name": "OpenAI API Key",
+            "settingsConfig": {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.openai.com/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "test-token"
+                }
+            }
+        }))
+        .expect("provider should deserialize");
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 1
+            }]
+        });
+
+        let result =
+            transform_claude_request_for_api_format(body, &provider, "openai_responses", None)
+                .unwrap();
+
+        assert!(result.get("max_tool_calls").is_none());
+    }
+
+    #[test]
+    fn compatibility_relay_responses_omits_web_search_max_uses() {
+        let provider: Provider = serde_json::from_value(json!({
+            "id": "relay",
+            "name": "Responses Relay",
+            "settingsConfig": {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://relay.example.com/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "test-token"
+                }
+            }
+        }))
+        .expect("provider should deserialize");
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 1
+            }]
+        });
+
+        let result =
+            transform_claude_request_for_api_format(body, &provider, "openai_responses", None)
+                .unwrap();
+
+        assert!(result.get("max_tool_calls").is_none());
+    }
+
+    #[test]
     fn openai_chat_omits_prompt_cache_key_without_explicit_key() {
         let provider: Provider = serde_json::from_value(json!({
             "id": "generic",
@@ -1422,5 +1515,123 @@ mod tests {
             transform_claude_request_for_api_format(body, &provider, "openai_chat", None).unwrap();
 
         assert!(result.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn buffered_incomplete_web_search_enforces_max_uses_before_failing() {
+        let policy = WebSearchRequestPolicy::from_anthropic_request(&json!({
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 1
+            }]
+        }))
+        .unwrap()
+        .unwrap();
+        let search = |id: &str| {
+            json!({
+                "id": id,
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": id, "sources": []}
+            })
+        };
+
+        let error = ClaudeAdapter
+            .transform_response_with_web_search(
+                json!({
+                    "id": "resp_incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [search("ws_1"), search("ws_2")]
+                }),
+                Some(&policy),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("WebSearch max_uses exceeded"));
+    }
+
+    #[test]
+    fn buffered_incomplete_web_search_never_becomes_partial_success() {
+        let policy = WebSearchRequestPolicy::from_anthropic_request(&json!({
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 2
+            }]
+        }))
+        .unwrap()
+        .unwrap();
+
+        let error = ClaudeAdapter
+            .transform_response_with_web_search(
+                json!({
+                    "id": "resp_incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [{
+                        "id": "ws_1",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "q", "sources": []}
+                    }]
+                }),
+                Some(&policy),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("upstream WebSearch response ended with status incomplete"));
+    }
+
+    #[test]
+    fn responses_failed_error_with_output_maps_to_anthropic_error() {
+        let result = ProviderAdapter::transform_response(
+            &ClaudeAdapter,
+            json!({
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "message": "bad request",
+                    "type": "invalid_request_error"
+                },
+                "output": []
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["type"], "error");
+        assert_eq!(result["error"]["type"], "invalid_request_error");
+        assert_eq!(result["error"]["message"], "bad request");
+    }
+
+    #[test]
+    fn web_search_responses_failed_error_maps_to_anthropic_error() {
+        let policy = WebSearchRequestPolicy::from_anthropic_request(&json!({
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }))
+        .unwrap()
+        .unwrap();
+
+        let result = ClaudeAdapter
+            .transform_response_with_web_search(
+                json!({
+                    "id": "resp_failed",
+                    "status": "failed",
+                    "error": {
+                        "message": "bad request",
+                        "type": "invalid_request_error"
+                    },
+                    "output": []
+                }),
+                Some(&policy),
+            )
+            .unwrap();
+
+        assert_eq!(result["type"], "error");
+        assert_eq!(result["error"]["type"], "invalid_request_error");
+        assert_eq!(result["error"]["message"], "bad request");
     }
 }

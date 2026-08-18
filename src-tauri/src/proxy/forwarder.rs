@@ -42,6 +42,87 @@ pub struct ForwardOptions {
     pub bypass_circuit_breaker: bool,
 }
 
+const RESPONSES_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const RESPONSES_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(4);
+const RESPONSES_SEMANTIC_RETRY_LIMIT: u32 = 3;
+const RESPONSES_RETRY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct ResponsesRetryState {
+    remaining: u32,
+    used: u32,
+    deadline_started_at: Option<Instant>,
+}
+
+impl ResponsesRetryState {
+    fn new(app_type: &AppType, configured_retries: u32) -> Self {
+        let remaining = if matches!(app_type, AppType::Claude) {
+            configured_retries.min(RESPONSES_SEMANTIC_RETRY_LIMIT)
+        } else {
+            0
+        };
+        Self {
+            remaining,
+            used: 0,
+            deadline_started_at: None,
+        }
+    }
+
+    fn timeout_origin(&self, provider_started_at: Instant) -> Instant {
+        self.deadline_started_at.unwrap_or(provider_started_at)
+    }
+
+    fn effective_timeout(&self, configured_timeout: Option<Duration>) -> Option<Duration> {
+        if self.deadline_started_at.is_some() {
+            configured_timeout.or(Some(RESPONSES_RETRY_FALLBACK_TIMEOUT))
+        } else {
+            configured_timeout
+        }
+    }
+
+    async fn wait_to_retry(
+        &mut self,
+        error: &ProxyError,
+        provider_started_at: Instant,
+        configured_timeout: Option<Duration>,
+    ) -> Result<bool, ProxyError> {
+        if !is_retryable_responses_pre_output_error(error) || self.remaining == 0 {
+            return Ok(false);
+        }
+
+        let retry_started_at = if configured_timeout.is_some() {
+            provider_started_at
+        } else {
+            Instant::now()
+        };
+        let deadline_started_at = *self.deadline_started_at.get_or_insert(retry_started_at);
+        let delay = responses_retry_backoff(self.used);
+        wait_for_responses_retry(
+            delay,
+            deadline_started_at,
+            configured_timeout.or(Some(RESPONSES_RETRY_FALLBACK_TIMEOUT)),
+        )
+        .await?;
+        self.remaining -= 1;
+        self.used += 1;
+        Ok(true)
+    }
+
+    fn active_remaining_timeout(
+        &self,
+        configured_timeout: Option<Duration>,
+    ) -> Result<Option<Duration>, ProxyError> {
+        let Some(started_at) = self.deadline_started_at else {
+            return Ok(None);
+        };
+        let timeout = configured_timeout.unwrap_or(RESPONSES_RETRY_FALLBACK_TIMEOUT);
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(request_timeout_error(timeout));
+        }
+        Ok(Some(remaining))
+    }
+}
+
 #[derive(Debug)]
 pub struct BufferedResponse {
     pub status: reqwest::StatusCode,
@@ -262,6 +343,7 @@ impl RequestForwarder {
         let mut attempted_providers = 0usize;
         let mut pending_upstream_response = None;
         let max_attempts = (options.max_retries as usize).saturating_add(1);
+        let mut responses_retry_state = ResponsesRetryState::new(app_type, options.max_retries);
 
         for provider in providers {
             if attempted_providers >= max_attempts {
@@ -288,7 +370,6 @@ impl RequestForwarder {
             pending_upstream_response = None;
             let provider_needs_transform = matches!(app_type, AppType::Claude)
                 && get_adapter(app_type).needs_transform(&provider);
-
             match self
                 .send_streaming_request(
                     app_type,
@@ -300,6 +381,7 @@ impl RequestForwarder {
                         max_retries: 0,
                         ..options
                     },
+                    &mut responses_retry_state,
                     &rectifier_config,
                 )
                 .await
@@ -507,6 +589,7 @@ impl RequestForwarder {
         let mut attempted_providers = 0usize;
         let mut pending_upstream_response = None;
         let max_attempts = (options.max_retries as usize).saturating_add(1);
+        let mut responses_retry_state = ResponsesRetryState::new(app_type, options.max_retries);
 
         for provider in providers {
             if attempted_providers >= max_attempts {
@@ -545,6 +628,7 @@ impl RequestForwarder {
                         max_retries: 0,
                         ..options
                     },
+                    &mut responses_retry_state,
                     &rectifier_config,
                 )
                 .await
@@ -711,38 +795,67 @@ impl RequestForwarder {
         body: &Value,
         headers: &HeaderMap,
         options: ForwardOptions,
+        responses_retry_state: &mut ResponsesRetryState,
         rectifier_config: &RectifierConfig,
     ) -> Result<StreamingAttemptOutcome, StreamingRequestError> {
         // Provider-specific clients may need to load native roots. Build and
         // retain this one before the upstream request timeout starts.
         let client = self.client_for_provider(app_type, provider);
-        let started_at = Instant::now();
+        let provider_started_at = Instant::now();
         let allow_transport_retry = uses_internal_transport_retry(app_type);
         let mut request_body = body.clone();
         let mut rectifier_retried = false;
 
         'request_loop: loop {
-            let base_request = self
-                .prepare_request_with_client(
-                    app_type,
-                    provider,
-                    &client,
-                    endpoint,
-                    &request_body,
-                    headers,
-                    options,
-                )
-                .await
-                .map_err(StreamingRequestError::BeforeResponse)?;
+            let preparation_timeout = responses_retry_state
+                .active_remaining_timeout(options.request_timeout)
+                .map_err(|error| {
+                    if rectifier_retried {
+                        StreamingRequestError::AfterResponse(error)
+                    } else {
+                        StreamingRequestError::BeforeResponse(error)
+                    }
+                })?;
+            let preparation = self.prepare_request_with_client(
+                app_type,
+                provider,
+                &client,
+                endpoint,
+                &request_body,
+                headers,
+                options,
+            );
+            let base_request = match preparation_timeout {
+                Some(remaining) => {
+                    tokio::time::timeout(remaining, preparation)
+                        .await
+                        .map_err(|_| {
+                            let error = request_timeout_error(
+                                options
+                                    .request_timeout
+                                    .unwrap_or(RESPONSES_RETRY_FALLBACK_TIMEOUT),
+                            );
+                            if rectifier_retried {
+                                StreamingRequestError::AfterResponse(error)
+                            } else {
+                                StreamingRequestError::BeforeResponse(error)
+                            }
+                        })?
+                }
+                None => preparation.await,
+            }
+            .map_err(StreamingRequestError::BeforeResponse)?;
             let mut attempt = 0u32;
 
             loop {
+                let request_timeout =
+                    responses_retry_state.effective_timeout(options.request_timeout);
                 let attempt_started_at = if allow_transport_retry {
                     Instant::now()
                 } else {
-                    started_at
+                    responses_retry_state.timeout_origin(provider_started_at)
                 };
-                let remaining_timeout = match options.request_timeout {
+                let remaining_timeout = match request_timeout {
                     Some(request_timeout) => {
                         let remaining_timeout =
                             request_timeout.saturating_sub(attempt_started_at.elapsed());
@@ -778,7 +891,7 @@ impl RequestForwarder {
                                 let buffered_response = read_streaming_error_response(
                                     response,
                                     attempt_started_at,
-                                    options.request_timeout,
+                                    request_timeout,
                                 )
                                 .await
                                 .map_err(StreamingRequestError::AfterResponse)?;
@@ -795,20 +908,52 @@ impl RequestForwarder {
                                     attempt_decision: AttemptDecision::FatalStop,
                                 });
                             }
-                            let response = prepare_success_streaming_response(
+                            let response = match prepare_success_streaming_response(
                                 response,
                                 attempt_started_at,
-                                options.request_timeout,
+                                request_timeout,
                                 uses_responses_protocol(app_type, provider, endpoint),
+                                anthropic_request_uses_web_search(app_type, body),
+                                responses_retry_state.deadline_started_at.is_some(),
                             )
                             .await
-                            .map_err(|error| {
-                                if rectifier_retried {
-                                    StreamingRequestError::AfterResponse(error)
-                                } else {
-                                    StreamingRequestError::BeforeResponse(error)
+                            {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    match responses_retry_state
+                                        .wait_to_retry(
+                                            &error,
+                                            provider_started_at,
+                                            options.request_timeout,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            log::warn!(
+                                                "Responses upstream was temporarily unavailable before output; retrying provider {} ({}/{})",
+                                                provider.id,
+                                                responses_retry_state.used,
+                                                responses_retry_state.used
+                                                    + responses_retry_state.remaining
+                                            );
+                                            continue;
+                                        }
+                                        Ok(false) => {}
+                                        Err(timeout_error) => {
+                                            return Err(if rectifier_retried {
+                                                StreamingRequestError::AfterResponse(timeout_error)
+                                            } else {
+                                                StreamingRequestError::BeforeResponse(timeout_error)
+                                            });
+                                        }
+                                    }
+                                    return Err(if rectifier_retried {
+                                        StreamingRequestError::AfterResponse(error)
+                                    } else {
+                                        StreamingRequestError::BeforeResponse(error)
+                                    });
                                 }
-                            })?;
+                            };
                             return Ok(StreamingAttemptOutcome {
                                 response: StreamingResponse::Live(response),
                                 attempt_decision: AttemptDecision::FatalStop,
@@ -819,10 +964,53 @@ impl RequestForwarder {
                             let buffered_response = read_streaming_error_response(
                                 response,
                                 attempt_started_at,
-                                options.request_timeout,
+                                request_timeout,
                             )
                             .await
                             .map_err(StreamingRequestError::AfterResponse)?;
+
+                            if uses_responses_protocol(app_type, provider, endpoint) {
+                                if let Err(error) =
+                                    validate_buffered_responses_body(&buffered_response.body)
+                                {
+                                    match responses_retry_state
+                                        .wait_to_retry(
+                                            &error,
+                                            provider_started_at,
+                                            options.request_timeout,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            log::warn!(
+                                                "Responses upstream was temporarily unavailable before output; retrying provider {} ({}/{})",
+                                                provider.id,
+                                                responses_retry_state.used,
+                                                responses_retry_state.used
+                                                    + responses_retry_state.remaining
+                                            );
+                                            continue;
+                                        }
+                                        Ok(false)
+                                            if is_retryable_responses_pre_output_error(&error) =>
+                                        {
+                                            return Err(if rectifier_retried {
+                                                StreamingRequestError::AfterResponse(error)
+                                            } else {
+                                                StreamingRequestError::BeforeResponse(error)
+                                            });
+                                        }
+                                        Ok(false) => {}
+                                        Err(timeout_error) => {
+                                            return Err(if rectifier_retried {
+                                                StreamingRequestError::AfterResponse(timeout_error)
+                                            } else {
+                                                StreamingRequestError::BeforeResponse(timeout_error)
+                                            });
+                                        }
+                                    }
+                                }
+                            }
 
                             if !rectifier_retried {
                                 if let Some(rectified_body) = maybe_rectify_claude_buffered_request(
@@ -867,7 +1055,7 @@ impl RequestForwarder {
                             continue;
                         }
 
-                        let mapped_error = map_request_send_error(error, options.request_timeout);
+                        let mapped_error = map_request_send_error(error, request_timeout);
                         return Err(if rectifier_retried {
                             StreamingRequestError::AfterResponse(mapped_error)
                         } else {
@@ -881,8 +1069,7 @@ impl RequestForwarder {
                         }
 
                         let timeout_error = request_timeout_error(
-                            options
-                                .request_timeout
+                            request_timeout
                                 .expect("request timeout should exist when timeout future errors"),
                         );
                         return Err(if rectifier_retried {
@@ -908,6 +1095,7 @@ impl RequestForwarder {
         body: &Value,
         headers: &HeaderMap,
         options: ForwardOptions,
+        responses_retry_state: &mut ResponsesRetryState,
         rectifier_config: &RectifierConfig,
     ) -> Result<BufferedAttemptOutcome, BufferedRequestError> {
         // Keep provider proxy client construction outside the shared request
@@ -915,31 +1103,59 @@ impl RequestForwarder {
         let client = self.client_for_provider(app_type, provider);
         let mut request_body = body.clone();
         let mut rectifier_retried = false;
-        let request_started_at = Instant::now();
+        let provider_started_at = Instant::now();
         let allow_transport_retry = uses_internal_transport_retry(app_type);
 
         'request_loop: loop {
-            let base_request = self
-                .prepare_request_with_client(
-                    app_type,
-                    provider,
-                    &client,
-                    endpoint,
-                    &request_body,
-                    headers,
-                    options,
-                )
-                .await
-                .map_err(BufferedRequestError::BeforeResponse)?;
+            let preparation_timeout = responses_retry_state
+                .active_remaining_timeout(options.request_timeout)
+                .map_err(|error| {
+                    if rectifier_retried {
+                        BufferedRequestError::AfterResponse(error)
+                    } else {
+                        BufferedRequestError::BeforeResponse(error)
+                    }
+                })?;
+            let preparation = self.prepare_request_with_client(
+                app_type,
+                provider,
+                &client,
+                endpoint,
+                &request_body,
+                headers,
+                options,
+            );
+            let base_request = match preparation_timeout {
+                Some(remaining) => {
+                    tokio::time::timeout(remaining, preparation)
+                        .await
+                        .map_err(|_| {
+                            let error = request_timeout_error(
+                                options
+                                    .request_timeout
+                                    .unwrap_or(RESPONSES_RETRY_FALLBACK_TIMEOUT),
+                            );
+                            if rectifier_retried {
+                                BufferedRequestError::AfterResponse(error)
+                            } else {
+                                BufferedRequestError::BeforeResponse(error)
+                            }
+                        })?
+                }
+                None => preparation.await,
+            }
+            .map_err(BufferedRequestError::BeforeResponse)?;
             let mut attempt = 0u32;
 
             loop {
+                let request_timeout =
+                    responses_retry_state.effective_timeout(options.request_timeout);
                 let attempt_started_at = if allow_transport_retry {
                     Instant::now()
                 } else {
-                    request_started_at
+                    responses_retry_state.timeout_origin(provider_started_at)
                 };
-                let remaining_timeout = match options.request_timeout {
+                let remaining_timeout = match request_timeout {
                     Some(request_timeout) => {
                         let remaining_timeout =
                             request_timeout.saturating_sub(attempt_started_at.elapsed());
@@ -970,7 +1186,7 @@ impl RequestForwarder {
                     Ok(Ok(response)) => {
                         let status = response.status();
                         let mut response_headers = response.headers().clone();
-                        let response_body = match options.request_timeout {
+                        let response_body = match request_timeout {
                             Some(request_timeout) => {
                                 let remaining_timeout =
                                     request_timeout.saturating_sub(attempt_started_at.elapsed());
@@ -1008,6 +1224,51 @@ impl RequestForwarder {
                             body: response_body,
                         };
 
+                        if !buffered_response.status.is_success()
+                            && uses_responses_protocol(app_type, provider, endpoint)
+                        {
+                            if let Err(error) =
+                                validate_buffered_responses_body(&buffered_response.body)
+                            {
+                                match responses_retry_state
+                                    .wait_to_retry(
+                                        &error,
+                                        provider_started_at,
+                                        options.request_timeout,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        log::warn!(
+                                            "Responses upstream was temporarily unavailable before output; retrying provider {} ({}/{})",
+                                            provider.id,
+                                            responses_retry_state.used,
+                                            responses_retry_state.used
+                                                + responses_retry_state.remaining
+                                        );
+                                        continue;
+                                    }
+                                    Ok(false)
+                                        if is_retryable_responses_pre_output_error(&error) =>
+                                    {
+                                        return Err(if rectifier_retried {
+                                            BufferedRequestError::AfterResponse(error)
+                                        } else {
+                                            BufferedRequestError::BeforeResponse(error)
+                                        });
+                                    }
+                                    Ok(false) => {}
+                                    Err(timeout_error) => {
+                                        return Err(if rectifier_retried {
+                                            BufferedRequestError::AfterResponse(timeout_error)
+                                        } else {
+                                            BufferedRequestError::BeforeResponse(timeout_error)
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
                         if buffered_response.status.is_success()
                             && uses_codex_anthropic_protocol(app_type, provider, endpoint)
                         {
@@ -1022,15 +1283,42 @@ impl RequestForwarder {
                         } else if buffered_response.status.is_success()
                             && uses_responses_protocol(app_type, provider, endpoint)
                         {
-                            validate_responses_success_body(&buffered_response.body).map_err(
-                                |error| {
-                                    if rectifier_retried {
-                                        BufferedRequestError::AfterResponse(error)
-                                    } else {
-                                        BufferedRequestError::BeforeResponse(error)
+                            if let Err(error) =
+                                validate_buffered_responses_body(&buffered_response.body)
+                            {
+                                match responses_retry_state
+                                    .wait_to_retry(
+                                        &error,
+                                        provider_started_at,
+                                        options.request_timeout,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        log::warn!(
+                                            "Responses upstream was temporarily unavailable before output; retrying provider {} ({}/{})",
+                                            provider.id,
+                                            responses_retry_state.used,
+                                            responses_retry_state.used
+                                                + responses_retry_state.remaining
+                                        );
+                                        continue;
                                     }
-                                },
-                            )?;
+                                    Ok(false) => {}
+                                    Err(timeout_error) => {
+                                        return Err(if rectifier_retried {
+                                            BufferedRequestError::AfterResponse(timeout_error)
+                                        } else {
+                                            BufferedRequestError::BeforeResponse(timeout_error)
+                                        });
+                                    }
+                                }
+                                return Err(if rectifier_retried {
+                                    BufferedRequestError::AfterResponse(error)
+                                } else {
+                                    BufferedRequestError::BeforeResponse(error)
+                                });
+                            }
                         }
 
                         if !rectifier_retried {
@@ -1065,7 +1353,7 @@ impl RequestForwarder {
                             continue;
                         }
 
-                        let mapped_error = map_request_send_error(error, options.request_timeout);
+                        let mapped_error = map_request_send_error(error, request_timeout);
                         return Err(if rectifier_retried {
                             BufferedRequestError::AfterResponse(mapped_error)
                         } else {
@@ -1079,8 +1367,7 @@ impl RequestForwarder {
                         }
 
                         let timeout_error = request_timeout_error(
-                            options
-                                .request_timeout
+                            request_timeout
                                 .expect("request timeout should exist when timeout future errors"),
                         );
                         return Err(if rectifier_retried {
@@ -1186,6 +1473,20 @@ fn uses_responses_protocol(app_type: &AppType, provider: &Provider, endpoint: &s
         && !super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
 }
 
+fn anthropic_request_uses_web_search(app_type: &AppType, body: &Value) -> bool {
+    matches!(app_type, AppType::Claude)
+        && body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tool_type| tool_type.starts_with("web_search_"))
+                })
+            })
+}
+
 fn uses_codex_anthropic_protocol(app_type: &AppType, provider: &Provider, endpoint: &str) -> bool {
     matches!(app_type, AppType::Codex)
         && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
@@ -1212,9 +1513,18 @@ async fn prepare_success_streaming_response(
     started_at: Instant,
     request_timeout: Option<Duration>,
     validate_responses_semantics: bool,
+    validate_responses_until_terminal: bool,
+    enforce_responses_total_timeout: bool,
 ) -> Result<LiveResponse, ProxyError> {
     if validate_responses_semantics {
-        return validate_responses_stream_start(response, started_at, request_timeout).await;
+        return validate_responses_stream_start(
+            response,
+            started_at,
+            request_timeout,
+            validate_responses_until_terminal,
+            enforce_responses_total_timeout,
+        )
+        .await;
     }
 
     let Some(request_timeout) = request_timeout else {
@@ -1249,8 +1559,12 @@ async fn validate_responses_stream_start(
     response: reqwest::Response,
     started_at: Instant,
     request_timeout: Option<Duration>,
+    validate_until_terminal: bool,
+    enforce_total_timeout: bool,
 ) -> Result<LiveResponse, ProxyError> {
     const MAX_PRIME_BYTES: usize = 256 * 1024;
+    const MAX_TERMINAL_VALIDATION_BYTES: usize = 4 * 1024 * 1024;
+    const TERMINAL_VALIDATION_TIMEOUT: Duration = Duration::from_secs(600);
 
     let status = response.status();
     let headers = response.headers().clone();
@@ -1259,17 +1573,40 @@ async fn validate_responses_stream_start(
     let mut replay_bytes = 0usize;
     let mut parse_buffer = String::new();
     let mut utf8_remainder = Vec::new();
+    let mut first_chunk_received_at = None;
 
     loop {
-        let next = match request_timeout {
-            Some(request_timeout) => {
-                let remaining_timeout = request_timeout.saturating_sub(started_at.elapsed());
+        let timeout_window = match first_chunk_received_at {
+            Some(first_chunk_received_at) if validate_until_terminal && !enforce_total_timeout => {
+                Some((TERMINAL_VALIDATION_TIMEOUT, first_chunk_received_at, false))
+            }
+            _ => request_timeout.map(|request_timeout| (request_timeout, started_at, true)),
+        };
+        let next = match timeout_window {
+            Some((timeout, timeout_started_at, is_first_byte_timeout)) => {
+                let remaining_timeout = timeout.saturating_sub(timeout_started_at.elapsed());
                 if remaining_timeout.is_zero() {
-                    return Err(stream_first_byte_timeout_error(request_timeout));
+                    return Err(if is_first_byte_timeout {
+                        stream_first_byte_timeout_error(timeout)
+                    } else {
+                        ProxyError::Timeout(format!(
+                            "Responses terminal validation timed out after {}s",
+                            timeout.as_secs()
+                        ))
+                    });
                 }
                 tokio::time::timeout(remaining_timeout, stream.next())
                     .await
-                    .map_err(|_| stream_first_byte_timeout_error(request_timeout))?
+                    .map_err(|_| {
+                        if is_first_byte_timeout {
+                            stream_first_byte_timeout_error(timeout)
+                        } else {
+                            ProxyError::Timeout(format!(
+                                "Responses terminal validation timed out after {}s",
+                                timeout.as_secs()
+                            ))
+                        }
+                    })?
             }
             None => stream.next().await,
         };
@@ -1302,25 +1639,46 @@ async fn validate_responses_stream_start(
                 "failed while validating Responses stream start: {error}"
             ))
         })?;
-        super::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+        first_chunk_received_at.get_or_insert_with(Instant::now);
         replay_bytes = replay_bytes.saturating_add(chunk.len());
+        if validate_until_terminal && replay_bytes > MAX_TERMINAL_VALIDATION_BYTES {
+            return Err(ProxyError::ForwardFailed(format!(
+                "Responses stream exceeded {MAX_TERMINAL_VALIDATION_BYTES} bytes before a terminal event"
+            )));
+        }
+        super::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
         replay_chunks.push(chunk);
 
         if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
             outcome?;
-            let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+            let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+            if validate_until_terminal {
+                return Ok(LiveResponse::from_stream(status, headers, replay));
+            }
+            let replay = replay.chain(stream);
             return Ok(LiveResponse::from_stream(status, headers, replay));
         }
 
         while let Some(block) = super::sse::take_sse_block(&mut parse_buffer) {
             if let Some(outcome) = inspect_responses_start_event(&block) {
                 outcome?;
-                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
-                return Ok(LiveResponse::from_stream(status, headers, replay));
+                if !validate_until_terminal || responses_block_is_terminal_success(&block) {
+                    let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+                    if validate_until_terminal {
+                        return Ok(LiveResponse::from_stream(status, headers, replay));
+                    }
+                    let replay = replay.chain(stream);
+                    return Ok(LiveResponse::from_stream(status, headers, replay));
+                }
             }
         }
 
-        if replay_bytes >= MAX_PRIME_BYTES {
+        if validate_until_terminal && replay_bytes >= MAX_TERMINAL_VALIDATION_BYTES {
+            return Err(ProxyError::ForwardFailed(format!(
+                "Responses stream exceeded {MAX_TERMINAL_VALIDATION_BYTES} bytes before a terminal event"
+            )));
+        }
+        if !validate_until_terminal && replay_bytes >= MAX_PRIME_BYTES {
             log::warn!(
                 "Responses semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing stream"
             );
@@ -1331,10 +1689,28 @@ async fn validate_responses_stream_start(
 }
 
 fn validate_responses_success_body(body: &[u8]) -> Result<(), ProxyError> {
-    if let Some(message) = responses_error_envelope_message(body) {
-        return Err(ProxyError::TransformError(format!(
-            "Responses upstream returned a 2xx failure: {message}"
-        )));
+    if let Some((error_type, message)) = responses_error_envelope(body) {
+        return Err(responses_upstream_error(&error_type, &message));
+    }
+    Ok(())
+}
+
+fn validate_buffered_responses_body(body: &[u8]) -> Result<(), ProxyError> {
+    if serde_json::from_slice::<Value>(body).is_ok() {
+        return validate_responses_success_body(body);
+    }
+
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Ok(());
+    };
+    let mut buffer = text.to_string();
+    while let Some(block) = super::sse::take_sse_block(&mut buffer) {
+        if let Some(Err(error)) = inspect_responses_start_event(&block) {
+            return Err(error);
+        }
+    }
+    if let Some(Err(error)) = inspect_responses_start_event(buffer.trim()) {
+        return Err(error);
     }
     Ok(())
 }
@@ -1364,30 +1740,37 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     Some(format!("{error_type}: {message}"))
 }
 
-fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
+fn responses_error_envelope(body: &[u8]) -> Option<(String, String)> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let status = value.get("status").and_then(Value::as_str);
     let has_error = value.get("error").is_some_and(|error| !error.is_null());
-    if !matches!(status, Some("failed" | "cancelled")) && !has_error {
+    let is_error_envelope = value.get("type").and_then(Value::as_str) == Some("error");
+    let has_error_code = value.get("code").and_then(Value::as_str).is_some();
+    if !matches!(status, Some("failed" | "cancelled"))
+        && !has_error
+        && !is_error_envelope
+        && !has_error_code
+    {
         return None;
     }
 
     let error = value.get("error").unwrap_or(&value);
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or_else(|| status.unwrap_or("error"));
+    let error_type = responses_error_type(&value, error, status);
     let message = error
         .get("message")
         .and_then(Value::as_str)
-        .or_else(|| error.as_str())
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| {
+            error
+                .as_str()
+                .filter(|candidate| !looks_like_responses_error_type(candidate))
+        })
         .filter(|message| !message.trim().is_empty())
         .unwrap_or(match status {
             Some("cancelled") => "response generation was cancelled",
             _ => "response generation failed",
         });
-    Some(format!("{error_type}: {message}"))
+    Some((error_type.to_string(), message.to_string()))
 }
 
 fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
@@ -1427,6 +1810,7 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
         response.get("status").and_then(Value::as_str),
         Some("failed" | "cancelled")
     ) || response.get("error").is_some_and(|error| !error.is_null())
+        || response.get("code").and_then(Value::as_str).is_some()
     {
         let error = response.get("error").unwrap_or(response);
         let message = error
@@ -1434,15 +1818,12 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
             .and_then(Value::as_str)
             .or_else(|| error.as_str())
             .unwrap_or("Responses upstream failed before output");
-        let error_type = error
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| error.get("code").and_then(Value::as_str))
-            .or_else(|| response.get("status").and_then(Value::as_str))
-            .unwrap_or("upstream_error");
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream {error_type}: {message}"
-        ))));
+        let error_type = responses_error_type(
+            response,
+            error,
+            response.get("status").and_then(Value::as_str),
+        );
+        return Some(Err(responses_upstream_error(&error_type, message)));
     }
 
     match event {
@@ -1453,18 +1834,136 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 .and_then(Value::as_str)
                 .or_else(|| error.as_str())
                 .unwrap_or("Responses upstream emitted an error before output");
-            let error_type = error
+            let error_type = responses_error_type(response, error, None);
+            Some(Err(responses_upstream_error(&error_type, message)))
+        }
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.function_call_arguments.delta"
+        | "response.reasoning.delta"
+        | "response.completed"
+        | "response.incomplete" => Some(Ok(())),
+        "response.output_item.added"
+            if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") =>
+        {
+            Some(Ok(()))
+        }
+        _ => None,
+    }
+}
+
+fn responses_error_type(envelope: &Value, error: &Value, fallback: Option<&str>) -> String {
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|error_type| !is_responses_error_wrapper(error_type))
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .or_else(|| {
+            envelope
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|candidate| looks_like_responses_error_type(candidate))
+        })
+        .or_else(|| envelope.get("code").and_then(Value::as_str))
+        .or_else(|| {
+            envelope
                 .get("type")
                 .and_then(Value::as_str)
-                .or_else(|| error.get("code").and_then(Value::as_str))
-                .unwrap_or("upstream_error");
-            Some(Err(ProxyError::TransformError(format!(
-                "Responses upstream {error_type}: {message}"
-            ))))
+                .filter(|error_type| !is_responses_error_wrapper(error_type))
+        })
+        .or_else(|| fallback.filter(|error_type| !is_responses_error_wrapper(error_type)))
+        .unwrap_or("upstream_error");
+    error_type.to_string()
+}
+
+fn looks_like_responses_error_type(candidate: &str) -> bool {
+    candidate.ends_with("_error") || candidate == "overloaded"
+}
+
+fn is_responses_error_wrapper(candidate: &str) -> bool {
+    matches!(
+        candidate,
+        "error" | "response.failed" | "failed" | "cancelled"
+    )
+}
+
+fn responses_block_is_terminal_success(block: &str) -> bool {
+    let mut named_event = None;
+    let mut data_lines = Vec::new();
+    for line in block.lines() {
+        if let Some(event) = super::sse::strip_sse_field(line, "event") {
+            named_event = Some(event.trim());
+        } else if let Some(data) = super::sse::strip_sse_field(line, "data") {
+            data_lines.push(data);
         }
-        "response.created" | "response.in_progress" | "response.queued" | "" => None,
-        _ => Some(Ok(())),
     }
+    let value = serde_json::from_str::<Value>(&data_lines.join("\n")).ok();
+    let event = named_event
+        .filter(|event| !event.is_empty())
+        .or_else(|| {
+            value
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    if matches!(event, "response.completed" | "response.incomplete") {
+        return true;
+    }
+    value
+        .as_ref()
+        .and_then(|value| value.get("response").unwrap_or(value).get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "completed" | "incomplete"))
+}
+
+fn responses_upstream_error(error_type: &str, message: &str) -> ProxyError {
+    let status = match error_type {
+        "service_unavailable_error" | "overloaded_error" | "server_error" => 503,
+        "rate_limit_error" => 429,
+        "authentication_error" => 401,
+        "permission_error" => 403,
+        "invalid_request_error" => 400,
+        _ => 502,
+    };
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        }
+    });
+    ProxyError::UpstreamError {
+        status,
+        body: Some(body.to_string()),
+    }
+}
+
+fn is_retryable_responses_pre_output_error(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::UpstreamError { status: 503, .. })
+}
+
+fn responses_retry_backoff(retry_index: u32) -> Duration {
+    let multiplier = 1u32.checked_shl(retry_index.min(2)).unwrap_or(4);
+    RESPONSES_RETRY_BACKOFF_BASE
+        .saturating_mul(multiplier)
+        .min(RESPONSES_RETRY_BACKOFF_MAX)
+}
+
+async fn wait_for_responses_retry(
+    delay: Duration,
+    started_at: Instant,
+    request_timeout: Option<Duration>,
+) -> Result<(), ProxyError> {
+    if let Some(request_timeout) = request_timeout {
+        let remaining = request_timeout.saturating_sub(started_at.elapsed());
+        if remaining <= delay {
+            return Err(request_timeout_error(request_timeout));
+        }
+    }
+
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 async fn read_streaming_error_response(

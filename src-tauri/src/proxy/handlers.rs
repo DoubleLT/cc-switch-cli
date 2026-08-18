@@ -6,7 +6,10 @@ use axum::{
 };
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use crate::{app_config::AppType, provider::Provider};
 
@@ -15,7 +18,10 @@ use super::{
     forwarder::{ForwardOptions, RequestForwarder},
     handler_context::HandlerContext,
     metrics::estimate_tokens_from_value,
-    providers::{ClaudeAdapter, ProviderAdapter},
+    providers::{
+        web_search_bridge::{WebSearchBufferedResponse, WebSearchRequestPolicy},
+        ClaudeAdapter, ProviderAdapter,
+    },
     response::{
         build_anthropic_stream_response, build_buffered_codex_anthropic_response_with_context,
         build_buffered_codex_chat_response, build_buffered_codex_chat_response_with_context,
@@ -183,6 +189,9 @@ async fn handle_claude_request(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let web_search_policy = WebSearchRequestPolicy::from_anthropic_request(&body)
+        .ok()
+        .flatten();
     let tool_schema_hints =
         super::providers::transform_gemini::extract_anthropic_tool_schema_hints(&body);
     let tool_schema_hints = (!tool_schema_hints.is_empty()).then_some(tool_schema_hints);
@@ -265,10 +274,18 @@ async fn handle_claude_request(
                         Some(forward_result.provider.id.clone()),
                         Some(context.session_id.clone()),
                         tool_schema_hints.clone(),
+                        (api_format == "openai_responses")
+                            .then(|| web_search_policy.clone())
+                            .flatten(),
                     )
                 } else {
                     build_json_response(response, first_byte_timeout, |body| {
-                        adapter.transform_response(body)
+                        adapter.transform_response_with_web_search(
+                            body,
+                            (api_format == "openai_responses")
+                                .then_some(web_search_policy.as_ref())
+                                .flatten(),
+                        )
                     })
                     .await
                 }
@@ -288,7 +305,12 @@ async fn handle_claude_request(
                                 tool_schema_hints.as_ref(),
                             )
                         } else {
-                            adapter.transform_response(body)
+                            adapter.transform_response_with_web_search(
+                                body,
+                                (api_format == "openai_responses")
+                                    .then_some(web_search_policy.as_ref())
+                                    .flatten(),
+                            )
                         }
                     })
                 } else {
@@ -366,7 +388,10 @@ async fn handle_claude_request(
             status,
             &response.headers,
             response.body,
-            provider.is_codex_oauth() && api_format == "openai_responses",
+            api_format == "openai_responses",
+            (api_format == "openai_responses")
+                .then_some(web_search_policy.as_ref())
+                .flatten(),
             |body| {
                 if api_format == "gemini_native" {
                     super::providers::transform_gemini_response_for_provider(
@@ -377,7 +402,12 @@ async fn handle_claude_request(
                         tool_schema_hints.as_ref(),
                     )
                 } else {
-                    adapter.transform_response(body)
+                    adapter.transform_response_with_web_search(
+                        body,
+                        (api_format == "openai_responses")
+                            .then_some(web_search_policy.as_ref())
+                            .flatten(),
+                    )
                 }
             },
         )
@@ -399,14 +429,23 @@ fn build_buffered_claude_transform_response<F>(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: Bytes,
-    aggregate_codex_oauth_responses_sse: bool,
+    aggregate_responses_sse: bool,
+    web_search_policy: Option<&WebSearchRequestPolicy>,
     transform: F,
 ) -> Result<PreparedResponse, ProxyError>
 where
     F: FnOnce(Value) -> Result<Value, ProxyError>,
 {
-    if aggregate_codex_oauth_responses_sse {
-        let body = responses_sse_to_response_value(&String::from_utf8_lossy(&body))?;
+    if status.is_success()
+        && aggregate_responses_sse
+        && serde_json::from_slice::<Value>(&body).is_err()
+        && buffered_body_looks_like_sse(&body)
+    {
+        let body = if let Some(policy) = web_search_policy {
+            responses_sse_to_web_search_response_value(&String::from_utf8_lossy(&body), policy)?
+        } else {
+            responses_sse_to_response_value(&String::from_utf8_lossy(&body))?
+        };
         let body = serde_json::to_vec(&body).map_err(|error| {
             ProxyError::RequestFailed(format!("serialize aggregated upstream SSE failed: {error}"))
         })?;
@@ -416,10 +455,76 @@ where
     build_buffered_json_response(status, headers, body, transform)
 }
 
+fn buffered_body_looks_like_sse(body: &[u8]) -> bool {
+    let Ok(body) = std::str::from_utf8(body) else {
+        return false;
+    };
+    body.lines().map(str::trim).any(|line| {
+        !line.is_empty()
+            && !line.starts_with(':')
+            && matches!(
+                line.split_once(':'),
+                Some(("event" | "data" | "id" | "retry", _))
+            )
+    })
+}
+
+fn responses_sse_to_web_search_response_value(
+    body: &str,
+    policy: &WebSearchRequestPolicy,
+) -> Result<Value, ProxyError> {
+    let mut buffer = body.to_string();
+    let mut accumulator = WebSearchBufferedResponse::new();
+
+    while let Some(block) = take_sse_block(&mut buffer) {
+        let mut event_name = "";
+        let mut data_lines = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                event_name = event.trim();
+            } else if let Some(data) = strip_sse_field(line, "data") {
+                data_lines.push(data);
+            }
+        }
+        if data_lines.is_empty() {
+            continue;
+        }
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let data: Value = serde_json::from_str(&data).map_err(|error| {
+            ProxyError::TransformError(format!("Failed to parse upstream SSE event: {error}"))
+        })?;
+        let event_name = if event_name.is_empty() {
+            data.get("type").and_then(Value::as_str).unwrap_or("")
+        } else {
+            event_name
+        };
+        if matches!(event_name, "response.failed" | "error") {
+            return Err(responses_event_to_anthropic_error(&data));
+        }
+        accumulator
+            .ingest_responses_event(event_name, &data)
+            .map_err(ProxyError::TransformError)?;
+    }
+
+    if !buffer.trim().is_empty() {
+        return Err(ProxyError::TransformError(
+            "WebSearch stream ended with an incomplete SSE frame".to_string(),
+        ));
+    }
+
+    accumulator
+        .seal_responses(policy)
+        .map_err(ProxyError::TransformError)
+}
+
 fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut buffer = body.to_string();
-    let mut completed_response: Option<Value> = None;
-    let mut output_items = Vec::new();
+    let mut terminal_response: Option<(String, Value)> = None;
+    let mut output_items: Vec<(Option<u64>, usize, Value)> = Vec::new();
+    let mut arrival_index = 0usize;
 
     while let Some(block) = take_sse_block(&mut buffer) {
         let mut event_name = "";
@@ -445,41 +550,231 @@ fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
         let data: Value = serde_json::from_str(&data).map_err(|error| {
             ProxyError::TransformError(format!("Failed to parse upstream SSE event: {error}"))
         })?;
+        let data_event_name = data.get("type").and_then(Value::as_str).unwrap_or("");
+        if !event_name.is_empty() && !data_event_name.is_empty() && event_name != data_event_name {
+            return Err(ProxyError::TransformError(format!(
+                "Conflicting upstream SSE event names: event={event_name}, data.type={data_event_name}"
+            )));
+        }
+        let event_name = if event_name.is_empty() {
+            data_event_name
+        } else {
+            event_name
+        };
+
+        if terminal_response.is_some()
+            && !matches!(event_name, "response.completed" | "response.incomplete")
+        {
+            return Err(ProxyError::TransformError(format!(
+                "upstream SSE event {event_name:?} received after terminal event"
+            )));
+        }
 
         match event_name {
             "response.output_item.done" => {
-                if let Some(item) = data.get("item") {
-                    output_items.push(item.clone());
+                let item = data.get("item").ok_or_else(|| {
+                    ProxyError::TransformError(
+                        "response.output_item.done is missing item".to_string(),
+                    )
+                })?;
+                let output_index = data.get("output_index").and_then(Value::as_u64);
+                let item_id = item.get("id").and_then(Value::as_str);
+                let duplicate_or_conflict =
+                    output_items
+                        .iter()
+                        .find(|(existing_index, _, existing_item)| {
+                            (*existing_index == output_index && output_index.is_some())
+                                || item_id.is_some_and(|item_id| {
+                                    existing_item.get("id").and_then(Value::as_str) == Some(item_id)
+                                })
+                        });
+                if let Some((existing_index, _, existing_item)) = duplicate_or_conflict {
+                    if *existing_index == output_index && existing_item == item {
+                        continue;
+                    }
+                    return Err(ProxyError::TransformError(
+                        "Conflicting response.output_item.done identity or payload".to_string(),
+                    ));
                 }
+                output_items.push((output_index, arrival_index, item.clone()));
+                arrival_index += 1;
             }
-            "response.completed" => {
-                completed_response = Some(data.get("response").cloned().unwrap_or(data));
+            "response.completed" | "response.incomplete" => {
+                let response = data
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| data.clone());
+                validate_responses_terminal_event(event_name, &response)?;
+                if let Some((existing_event_name, existing_response)) = &terminal_response {
+                    if existing_event_name == event_name && existing_response == &response {
+                        continue;
+                    }
+                    return Err(ProxyError::TransformError(
+                        "Conflicting or repeated terminal response event".to_string(),
+                    ));
+                }
+                terminal_response = Some((event_name.to_string(), response));
             }
-            "response.failed" => {
-                let message = data
-                    .pointer("/response/error/message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("response.failed event received");
-                return Err(ProxyError::TransformError(message.to_string()));
-            }
+            "response.failed" | "error" => return Err(responses_event_to_anthropic_error(&data)),
             _ => {}
         }
     }
 
-    let mut response = completed_response.ok_or_else(|| {
-        ProxyError::TransformError("No response.completed event in upstream SSE".to_string())
+    if !buffer.trim().is_empty() {
+        return Err(ProxyError::TransformError(
+            "Responses stream ended with an incomplete SSE frame".to_string(),
+        ));
+    }
+
+    let (_, mut response) = terminal_response.ok_or_else(|| {
+        ProxyError::TransformError("No terminal response event in upstream SSE".to_string())
     })?;
 
     if !output_items.is_empty() {
+        output_items.sort_by(|left, right| match (left.0, right.0) {
+            (Some(left_index), Some(right_index)) => {
+                left_index.cmp(&right_index).then(left.1.cmp(&right.1))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.1.cmp(&right.1),
+        });
         let Some(response) = response.as_object_mut() else {
             return Err(ProxyError::TransformError(
-                "response.completed payload is not an object".to_string(),
+                "terminal response payload is not an object".to_string(),
             ));
         };
-        response.insert("output".to_string(), Value::Array(output_items));
+
+        let mut merged_output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, item)| (index as u64, item))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        let mut snapshot_ids = BTreeMap::new();
+        for (index, item) in &merged_output {
+            if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                if snapshot_ids.insert(item_id.to_string(), *index).is_some() {
+                    return Err(ProxyError::TransformError(format!(
+                        "terminal response contains duplicate output item id {item_id}"
+                    )));
+                }
+            }
+        }
+
+        for (output_index, _, item) in output_items {
+            if let Some(output_index) = output_index {
+                let item_id = item.get("id").and_then(Value::as_str);
+                if let Some(existing) = merged_output.get(&output_index) {
+                    let existing_id = existing.get("id").and_then(Value::as_str);
+                    if existing_id.is_some() && item_id.is_some() && existing_id != item_id {
+                        return Err(ProxyError::TransformError(format!(
+                            "output index {output_index} identifies conflicting item ids"
+                        )));
+                    }
+                }
+                if let Some(item_id) = item_id {
+                    if let Some(existing_index) = snapshot_ids.get(item_id) {
+                        if *existing_index != output_index {
+                            return Err(ProxyError::TransformError(format!(
+                                "output item id {item_id} appears at conflicting indexes"
+                            )));
+                        }
+                    }
+                    snapshot_ids.insert(item_id.to_string(), output_index);
+                }
+                merged_output.insert(output_index, item);
+                continue;
+            }
+
+            let item_id = item.get("id").and_then(Value::as_str);
+            let matching_index = item_id.and_then(|item_id| {
+                merged_output.iter().find_map(|(index, existing)| {
+                    (existing.get("id").and_then(Value::as_str) == Some(item_id)).then_some(*index)
+                })
+            });
+            let output_index = matching_index.unwrap_or_else(|| {
+                merged_output
+                    .last_key_value()
+                    .map(|(index, _)| index.saturating_add(1))
+                    .unwrap_or(0)
+            });
+            merged_output.insert(output_index, item);
+        }
+
+        response.insert(
+            "output".to_string(),
+            Value::Array(merged_output.into_values().collect()),
+        );
     }
 
     Ok(response)
+}
+
+fn responses_event_to_anthropic_error(data: &Value) -> ProxyError {
+    let error = data
+        .get("error")
+        .or_else(|| data.pointer("/response/error"));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("Responses upstream failure");
+    let error_type = error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message
+        }
+    });
+    ProxyError::UpstreamError {
+        status: reqwest::StatusCode::BAD_GATEWAY.as_u16(),
+        body: Some(body.to_string()),
+    }
+}
+
+fn validate_responses_terminal_event(event_name: &str, response: &Value) -> Result<(), ProxyError> {
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("terminal response contains an error");
+        return Err(ProxyError::TransformError(message.to_string()));
+    }
+
+    let status = response.get("status").and_then(Value::as_str);
+    match event_name {
+        "response.completed" if status != Some("completed") => Err(ProxyError::TransformError(
+            format!("response.completed carried invalid status {:?}", status),
+        )),
+        "response.incomplete" if status != Some("incomplete") => Err(ProxyError::TransformError(
+            format!("response.incomplete carried invalid status {:?}", status),
+        )),
+        "response.incomplete" => {
+            let reason = response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str);
+            if matches!(reason, Some("max_output_tokens") | Some("max_tokens")) {
+                Ok(())
+            } else {
+                Err(ProxyError::TransformError(format!(
+                    "unsupported response.incomplete reason {:?}",
+                    reason
+                )))
+            }
+        }
+        _ => Ok(()),
+    }
 }
 
 fn should_use_claude_transform_streaming(
@@ -1255,7 +1550,7 @@ mod tests {
     use super::{
         build_buffered_claude_transform_response, endpoint_with_query, handle_responses,
         handle_responses_compact, responses_sse_to_response_value,
-        should_use_claude_transform_streaming,
+        responses_sse_to_web_search_response_value, should_use_claude_transform_streaming,
     };
     use crate::{
         app_config::AppType,
@@ -1266,6 +1561,8 @@ mod tests {
             provider_router::ProviderRouter,
             providers::codex_chat_history::CodexChatHistoryStore,
             providers::gemini_shadow::GeminiShadowStore,
+            providers::web_search_bridge::WebSearchRequestPolicy,
+            providers::{ClaudeAdapter, ProviderAdapter},
             server::ProxyServerState,
             types::{ProxyConfig, ProxyStatus},
         },
@@ -1670,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_oauth_buffered_transform_aggregates_sse_before_json_parse() {
+    fn responses_buffered_transform_aggregates_sse_before_json_parse() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -1689,6 +1986,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
             &headers,
             Bytes::from(sse),
             true,
+            None,
             Ok,
         )
         .unwrap();
@@ -1706,7 +2004,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     }
 
     #[test]
-    fn codex_oauth_buffered_transform_aggregates_sse_without_content_type() {
+    fn responses_buffered_transform_aggregates_sse_without_content_type() {
         let headers = reqwest::header::HeaderMap::new();
         let sse = r#"event: response.completed
 data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":10,"output_tokens":2}}}
@@ -1718,6 +2016,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
             &headers,
             Bytes::from(sse),
             true,
+            None,
             Ok,
         )
         .unwrap();
@@ -1763,6 +2062,108 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     }
 
     #[test]
+    fn responses_buffered_transform_keeps_json_fallback() {
+        let headers = reqwest::header::HeaderMap::new();
+        let json_body = json!({
+            "id": "resp_json",
+            "status": "completed",
+            "model": "gpt-5.6-sol",
+            "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+
+        let prepared = build_buffered_claude_transform_response(
+            reqwest::StatusCode::OK,
+            &headers,
+            Bytes::from(serde_json::to_vec(&json_body).unwrap()),
+            true,
+            None,
+            Ok,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(
+            prepared
+                .body_bytes
+                .as_ref()
+                .expect("buffered response should keep body bytes"),
+        )
+        .unwrap();
+
+        assert_eq!(body, json_body);
+    }
+
+    #[test]
+    fn responses_buffered_transform_preserves_plain_text_http_error() {
+        let headers = reqwest::header::HeaderMap::new();
+        let raw_body = Bytes::from_static(b"upstream unavailable");
+
+        let prepared = build_buffered_claude_transform_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &headers,
+            raw_body.clone(),
+            true,
+            None,
+            Ok,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.response.status(), reqwest::StatusCode::BAD_GATEWAY);
+        assert_eq!(prepared.body_bytes.as_ref(), Some(&raw_body));
+    }
+
+    #[test]
+    fn responses_buffered_transform_does_not_treat_http_error_as_sse() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("text/plain"),
+        );
+        let raw_body = Bytes::from_static(b"data: relay overloaded\n\n");
+
+        let prepared = build_buffered_claude_transform_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            &headers,
+            raw_body.clone(),
+            true,
+            None,
+            Ok,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(prepared.body_bytes.as_ref(), Some(&raw_body));
+    }
+
+    #[test]
+    fn responses_buffered_failed_http_error_maps_to_anthropic_error() {
+        let headers = reqwest::header::HeaderMap::new();
+        let upstream = json!({
+            "id": "resp_failed",
+            "status": "failed",
+            "error": {
+                "message": "bad request",
+                "type": "invalid_request_error"
+            },
+            "output": []
+        });
+
+        let prepared = build_buffered_claude_transform_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            &headers,
+            Bytes::from(serde_json::to_vec(&upstream).unwrap()),
+            true,
+            None,
+            |body| ProviderAdapter::transform_response(&ClaudeAdapter, body),
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(prepared.body_bytes.as_ref().unwrap()).unwrap();
+
+        assert_eq!(prepared.response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["message"], "bad request");
+    }
+
+    #[test]
     fn responses_sse_to_response_value_collects_output_items() {
         let sse = r#"event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}
@@ -1796,15 +2197,135 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_crlf\",\"stat
     }
 
     #[test]
+    fn responses_sse_data_only_incomplete_orders_items_and_maps_max_tokens() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_second\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_first\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"model\":\"gpt-5.6-sol\",\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":8,\"output_tokens\":6}}}\n\n"
+        );
+
+        let response = responses_sse_to_response_value(sse).unwrap();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["output"][0]["id"], "msg_first");
+        assert_eq!(response["output"][1]["id"], "msg_second");
+
+        let anthropic =
+            crate::proxy::providers::transform_responses::responses_to_anthropic(response).unwrap();
+        assert_eq!(anthropic["stop_reason"], "max_tokens");
+        assert_eq!(anthropic["content"][0]["text"], "first");
+        assert_eq!(anthropic["content"][1]["text"], "second");
+    }
+
+    #[test]
+    fn responses_sse_merges_partial_done_items_with_terminal_snapshot() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_b\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"B done\"}]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"C done\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_partial\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"output\":[{\"id\":\"msg_a\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A snapshot\"}]},{\"id\":\"msg_b\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"B snapshot\"}]},{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"C snapshot\"}]}],\"usage\":{\"input_tokens\":8,\"output_tokens\":6}}}\n\n"
+        );
+
+        let response = responses_sse_to_response_value(sse).unwrap();
+
+        assert_eq!(response["output"].as_array().unwrap().len(), 3);
+        assert_eq!(response["output"][0]["id"], "msg_a");
+        assert_eq!(response["output"][0]["content"][0]["text"], "A snapshot");
+        assert_eq!(response["output"][1]["id"], "msg_b");
+        assert_eq!(response["output"][1]["content"][0]["text"], "B done");
+        assert_eq!(response["output"][2]["id"], "msg_c");
+        assert_eq!(response["output"][2]["content"][0]["text"], "C done");
+    }
+
+    #[test]
+    fn responses_sse_rejects_indexed_done_with_conflicting_snapshot_id() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_b\",\"type\":\"message\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_a\",\"type\":\"message\",\"content\":[]},{\"id\":\"msg_b\",\"type\":\"message\",\"content\":[]}]}}\n\n"
+        );
+
+        let error = responses_sse_to_response_value(sse).unwrap_err();
+        assert!(error.to_string().contains("conflicting item ids"));
+    }
+
+    #[test]
     fn responses_sse_to_response_value_returns_err_on_response_failed() {
         let sse = "event: response.failed\n\
 data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream blew up\"}}}\n\n";
 
         let err = responses_sse_to_response_value(sse).unwrap_err();
         match err {
-            ProxyError::TransformError(message) => assert!(message.contains("upstream blew up")),
-            other => panic!("expected TransformError, got {other:?}"),
+            ProxyError::UpstreamError { status, body } => {
+                assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY.as_u16());
+                let body: Value = serde_json::from_str(body.as_deref().unwrap()).unwrap();
+                assert_eq!(body["type"], "error");
+                assert_eq!(body["error"]["message"], "upstream blew up");
+            }
+            other => panic!("expected UpstreamError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn responses_sse_rejects_terminal_event_status_mismatch() {
+        let sse = "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"message\":\"quota\"},\"output\":[]}}\n\n";
+
+        let error = responses_sse_to_response_value(sse).unwrap_err();
+        assert!(error.to_string().contains("quota"));
+    }
+
+    #[test]
+    fn responses_sse_rejects_unsupported_incomplete_reason() {
+        let sse = "event: response.incomplete\n\
+data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_filtered\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"output\":[]}}\n\n";
+
+        let error = responses_sse_to_response_value(sse).unwrap_err();
+        assert!(error.to_string().contains("content_filter"));
+    }
+
+    #[test]
+    fn responses_sse_rejects_conflicting_done_item_identity() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_a\",\"type\":\"message\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_b\",\"type\":\"message\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+
+        let error = responses_sse_to_response_value(sse).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Conflicting response.output_item.done"));
+    }
+
+    #[test]
+    fn responses_sse_rejects_content_after_terminal_event() {
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_a\",\"text\":\"late\"}\n\n"
+        );
+
+        let error = responses_sse_to_response_value(sse).unwrap_err();
+        assert!(error.to_string().contains("after terminal"));
+    }
+
+    #[test]
+    fn responses_sse_rejects_conflicting_event_and_data_type() {
+        let sse = "event: response.completed\n\
+data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n";
+
+        let error = responses_sse_to_response_value(sse).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Conflicting upstream SSE event names"));
+    }
+
+    #[test]
+    fn responses_sse_accepts_exact_duplicate_done_and_terminal_events() {
+        let done = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_a\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A\"}]}}\n\n";
+        let terminal = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n";
+        let sse = format!("{done}{done}{terminal}{terminal}");
+
+        let response = responses_sse_to_response_value(&sse).unwrap();
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["id"], "msg_a");
     }
 
     #[test]
@@ -1813,5 +2334,47 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n";
 
         assert!(responses_sse_to_response_value(sse).is_err());
+    }
+
+    #[test]
+    fn web_search_sse_aggregation_rejects_terminal_snapshot_without_done_item() {
+        let policy = WebSearchRequestPolicy::from_anthropic_request(&json!({
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }))
+        .unwrap()
+        .unwrap();
+        let sse = r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","output":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"q","sources":[]}}]}}
+
+"#;
+
+        let error = responses_sse_to_web_search_response_value(sse, &policy).unwrap_err();
+        assert!(error.to_string().contains("without output_item.done"));
+    }
+
+    #[test]
+    fn web_search_sse_aggregation_rejects_error_event_before_completed() {
+        let policy = WebSearchRequestPolicy::from_anthropic_request(&json!({
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }))
+        .unwrap()
+        .unwrap();
+        let sse = r#"event: error
+data: {"type":"error","error":{"type":"server_error","message":"redacted"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","output":[]}}
+
+"#;
+
+        let error = responses_sse_to_web_search_response_value(sse, &policy).unwrap_err();
+        match error {
+            ProxyError::UpstreamError { body, .. } => {
+                let body: Value = serde_json::from_str(body.as_deref().unwrap()).unwrap();
+                assert_eq!(body["type"], "error");
+                assert_eq!(body["error"]["message"], "redacted");
+            }
+            other => panic!("expected UpstreamError, got {other:?}"),
+        }
     }
 }

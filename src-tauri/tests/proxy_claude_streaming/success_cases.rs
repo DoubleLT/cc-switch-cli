@@ -78,6 +78,59 @@ async fn handle_streaming_responses(
     )
 }
 
+async fn handle_stream_only_responses(
+    State(state): State<UpstreamState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    record_upstream_request(&state, &headers, body.clone()).await;
+    if body.get("stream").and_then(Value::as_bool) != Some(true) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Stream must be set to true"})),
+        )
+            .into_response();
+    }
+
+    let sse = concat!(
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_non_stream\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"non-stream bridge ok\",\"annotations\":[]}]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_non_stream\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n"
+    );
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        sse,
+    )
+        .into_response()
+}
+
+async fn handle_streaming_responses_web_search(
+    State(state): State<UpstreamState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    record_upstream_request(&state, &headers, body).await;
+    let sse = concat!(
+        "event: response.output_item.done\n",
+        "data: {\"output_index\":1,\"item\":{\"id\":\"ws_search\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"Rust\",\"sources\":[{\"type\":\"url\",\"url\":\"https://example.com/rust\"}]}}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"output_index\":3,\"item\":{\"id\":\"ws_open\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"open_page\",\"url\":\"https://example.com/rust\"}}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"output_index\":5,\"item\":{\"id\":\"ws_find\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"find_in_page\",\"url\":\"https://example.com/rust\",\"pattern\":\"ownership\"}}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"output_index\":6,\"item\":{\"id\":\"msg_search\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A😊中B\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com/rust\",\"title\":\"Rust ownership\",\"start_index\":1,\"end_index\":3}]}]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"response\":{\"id\":\"resp_search\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":5}}}\n\n"
+    );
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        sse,
+    )
+}
+
 async fn handle_buffered_chat_fallback(
     State(state): State<UpstreamState>,
     headers: HeaderMap,
@@ -653,6 +706,214 @@ async fn proxy_claude_openai_responses_streaming_transforms_sse() {
     assert_eq!(upstream_state.api_key.lock().await.as_deref(), None);
 
     service.stop().await.expect("stop proxy service");
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn proxy_claude_openai_responses_non_stream_uses_streaming_upstream() {
+    let upstream_state = UpstreamState::default();
+    let upstream_router = Router::new()
+        .route("/v1/responses", post(handle_stream_only_responses))
+        .with_state(upstream_state.clone());
+    let upstream_listener = bind_test_listener().await;
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_router).await;
+    });
+
+    let db = Arc::new(Database::memory().expect("create memory database"));
+    let provider = Provider {
+        id: "claude-openai-responses-non-stream".to_string(),
+        name: "Claude OpenAI Responses Non-stream".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://{}", upstream_addr),
+                "ANTHROPIC_API_KEY": "sk-test-claude"
+            }
+        }),
+        website_url: None,
+        category: Some("claude".to_string()),
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..ProviderMeta::default()
+        }),
+        icon: None,
+        icon_color: None,
+        in_failover_queue: true,
+    };
+    db.save_provider("claude", &provider).unwrap();
+    db.set_current_provider("claude", &provider.id).unwrap();
+    set_claude_proxy_port_to_ephemeral(&db).await;
+    let service = ProxyService::new(db);
+    let mut config = service.get_config().await.unwrap();
+    config.listen_port = 0;
+    let proxy = service.start_with_runtime_config(config).await.unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}:{}/v1/messages",
+            proxy.address, proxy.port
+        ))
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "stream": false,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "verify a domain"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json")));
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["text"], "non-stream bridge ok");
+    assert_eq!(body["usage"]["input_tokens"], 9);
+    assert_eq!(body["usage"]["output_tokens"], 4);
+
+    let upstream = upstream_state.request_body.lock().await.clone().unwrap();
+    assert_eq!(upstream["stream"], true);
+    assert_eq!(upstream["model"], "claude-haiku-4-5");
+
+    service.stop().await.unwrap();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn proxy_claude_web_search_uses_buffered_responses_bridge() {
+    let upstream_state = UpstreamState::default();
+    let upstream_router = Router::new()
+        .route("/v1/responses", post(handle_streaming_responses_web_search))
+        .with_state(upstream_state.clone());
+    let upstream_listener = bind_test_listener().await;
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_router).await;
+    });
+
+    let db = Arc::new(Database::memory().expect("create memory database"));
+    let provider = Provider {
+        id: "claude-web-search-buffered".to_string(),
+        name: "Claude WebSearch Buffered".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://{}", upstream_addr),
+                "ANTHROPIC_API_KEY": "sk-test-claude"
+            }
+        }),
+        website_url: None,
+        category: Some("claude".to_string()),
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..ProviderMeta::default()
+        }),
+        icon: None,
+        icon_color: None,
+        in_failover_queue: true,
+    };
+    db.save_provider("claude", &provider).unwrap();
+    db.set_current_provider("claude", &provider.id).unwrap();
+    set_claude_proxy_port_to_ephemeral(&db).await;
+    let service = ProxyService::new(db);
+    let mut config = service.get_config().await.unwrap();
+    config.listen_port = 0;
+    let proxy = service.start_with_runtime_config(config).await.unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}:{}/v1/messages",
+            proxy.address, proxy.port
+        ))
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Search Rust"}],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 1,
+                "allowed_domains": ["example.com"],
+                "blocked_domains": []
+            }],
+            "tool_choice": {"type": "auto"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.unwrap();
+    let events = parse_sse_events(&body);
+    let block_types = events
+        .iter()
+        .filter_map(|event| event.pointer("/content_block/type").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        block_types,
+        vec![
+            "server_tool_use",
+            "web_search_tool_result",
+            "server_tool_use",
+            "web_search_tool_result",
+            "server_tool_use",
+            "web_search_tool_result",
+            "text"
+        ]
+    );
+    let result = events
+        .iter()
+        .find(|event| {
+            event
+                .pointer("/content_block/tool_use_id")
+                .and_then(Value::as_str)
+                == Some("ws_search")
+        })
+        .unwrap();
+    assert_eq!(
+        result["content_block"]["content"][0]["title"],
+        "Rust ownership"
+    );
+    let citation = events
+        .iter()
+        .find_map(|event| event.pointer("/delta/citation"))
+        .unwrap();
+    assert_eq!(citation["cited_text"], "😊中");
+    let terminal = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("message_delta"))
+        .unwrap();
+    assert_eq!(terminal["delta"]["stop_reason"], "end_turn");
+    assert_eq!(
+        terminal["usage"]["server_tool_use"]["web_search_requests"],
+        1
+    );
+
+    let upstream = upstream_state.request_body.lock().await.clone().unwrap();
+    assert_eq!(upstream["tools"][0]["type"], "web_search");
+    assert_eq!(
+        upstream["tools"][0]["filters"]["allowed_domains"],
+        json!(["example.com"])
+    );
+    assert!(upstream.get("max_tool_calls").is_none());
+    assert!(upstream["include"]
+        .as_array()
+        .is_some_and(|values| values.contains(&json!("web_search_call.action.sources"))));
+
+    service.stop().await.unwrap();
     upstream_handle.abort();
 }
 
