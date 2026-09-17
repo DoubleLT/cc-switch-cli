@@ -391,6 +391,11 @@ impl AnthropicToResponsesState {
                 if !self.stream_truncated {
                     if is_custom_tool {
                         let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                        events.push(sse::custom_tool_call_input_delta(
+                            output_index,
+                            &item_id,
+                            input,
+                        ));
                         events.push(sse::custom_tool_call_input_done(
                             output_index,
                             &item_id,
@@ -1147,6 +1152,70 @@ mod tests {
         let merged = run_with_context(input, context).await;
         assert!(merged.contains("\"namespace\":\"mcp_files\""));
         assert!(merged.contains("\"name\":\"read\""));
+    }
+
+    #[tokio::test]
+    async fn test_additional_namespace_custom_tool_stream_restores_identity() {
+        let context =
+            super::super::transform_codex_chat::build_codex_tool_context_from_request(&json!({
+                "input": [{
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "tools": [{"type": "custom", "name": "exec"}]
+                    }]
+                }]
+            }));
+        let upstream_name = context.chat_name_for_response_custom("exec", Some("functions"));
+        let input = format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_additional\",\"model\":\"claude\"}}}}\n\n",
+                "event: content_block_start\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"call_exec\",\"name\":\"{}\"}}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"input\\\":\\\"pwd\\\"}}\"}}}}\n\n",
+                "event: content_block_stop\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+            upstream_name
+        );
+        let merged = run_with_context(&input, context).await;
+
+        assert!(merged.contains("event: response.output_item.added"));
+        assert!(merged.contains("event: response.custom_tool_call_input.delta"));
+        assert!(merged.contains("event: response.custom_tool_call_input.done"));
+        assert!(merged.contains("event: response.output_item.done"));
+        assert!(merged.contains("\"type\":\"custom_tool_call\""));
+        assert!(merged.contains("\"namespace\":\"functions\""));
+        assert!(merged.contains("\"name\":\"exec\""));
+        assert!(merged.contains("\"input\":\"pwd\""));
+    }
+
+    #[tokio::test]
+    async fn test_custom_tool_empty_input_still_emits_delta_and_done() {
+        let context = super::super::transform_codex_chat::build_codex_tool_context_from_request(
+            &json!({"tools": [{"type": "custom", "name": "exec"}]}),
+        );
+        let input = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"model\":\"claude\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_empty\",\"name\":\"exec\",\"input\":{\"input\":\"\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let merged = run_with_context(input, context).await;
+        assert!(merged.contains("event: response.custom_tool_call_input.delta"));
+        assert!(merged.contains("\"delta\":\"\""));
+        assert!(merged.contains("event: response.custom_tool_call_input.done"));
+        assert!(merged.contains("\"input\":\"\""));
     }
 
     #[tokio::test]

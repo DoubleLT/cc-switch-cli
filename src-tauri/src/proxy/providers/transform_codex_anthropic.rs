@@ -250,10 +250,12 @@ pub fn responses_request_to_anthropic(
     }
     if let Some(items) = body.get("input").and_then(Value::as_array) {
         for item in items {
-            if matches!(
-                item.get("role").and_then(Value::as_str),
-                Some("system" | "developer")
-            ) {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools")
+                && matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+            {
                 system_parts.extend(responses_system_text(item));
             }
         }
@@ -479,10 +481,15 @@ fn map_tool_choice_to_anthropic(tool_choice: &Value, tool_context: &CodexToolCon
                 let upstream_name = tool_context.chat_name_for_response_function(name, namespace);
                 json!({ "type": "tool", "name": upstream_name })
             }
-            Some("custom") => json!({
-                "type": "tool",
-                "name": obj.get("name").and_then(|value| value.as_str()).unwrap_or("")
-            }),
+            Some("custom") => {
+                let name = obj
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let namespace = obj.get("namespace").and_then(|value| value.as_str());
+                let upstream_name = tool_context.chat_name_for_response_custom(name, namespace);
+                json!({ "type": "tool", "name": upstream_name })
+            }
             Some("tool_search") => {
                 json!({ "type": "tool", "name": TOOL_SEARCH_PROXY_NAME })
             }
@@ -573,6 +580,8 @@ fn convert_input_to_messages(
                     .get("name")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                let namespace = item.get("namespace").and_then(|value| value.as_str());
+                let upstream_name = tool_context.chat_name_for_response_custom(name, namespace);
                 let input = item.get("input").cloned().unwrap_or_else(|| json!(""));
                 push_block(
                     &mut messages,
@@ -580,7 +589,7 @@ fn convert_input_to_messages(
                     json!({
                         "type": "tool_use",
                         "id": call_id,
-                        "name": name,
+                        "name": upstream_name,
                         "input": { "input": input }
                     }),
                 );
@@ -620,6 +629,7 @@ fn convert_input_to_messages(
                 }
                 push_tool_result_block(&mut messages, block);
             }
+            Some("additional_tools") => {}
             Some("input_text") => {
                 if let Some(text) = item
                     .get("text")
@@ -1710,6 +1720,107 @@ mod tests {
     }
 
     #[test]
+    fn test_request_additional_namespace_tools_are_forwarded() {
+        let input = json!({
+            "model": "claude-sonnet-5",
+            "max_output_tokens": 100,
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "id": "tools_1",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "Local command tools",
+                        "tools": [{
+                            "type": "custom",
+                            "name": "exec",
+                            "description": "Run a shell command",
+                            "format": {"type": "grammar", "syntax": "lark"}
+                        }, {
+                            "type": "function",
+                            "name": "read_file",
+                            "description": "Read a file",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"}
+                                },
+                                "required": ["path"]
+                            }
+                        }]
+                    }]
+                },
+                {"role": "user", "content": "run pwd"},
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_call_previous",
+                    "call_id": "call_previous",
+                    "namespace": "functions",
+                    "name": "exec",
+                    "input": "pwd"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_previous",
+                    "output": "/workspace"
+                }
+            ],
+            "tool_choice": {"type": "custom", "namespace": "functions", "name": "exec"}
+        });
+
+        let context = build_codex_tool_context_from_request(&input);
+        let exec_chat_name = context.chat_name_for_response_custom("exec", Some("functions"));
+        let read_file_chat_name =
+            context.chat_name_for_response_function("read_file", Some("functions"));
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], exec_chat_name);
+        assert_eq!(tools[0]["input_schema"]["required"], json!(["input"]));
+        assert_eq!(tools[1]["name"], read_file_chat_name);
+        assert_eq!(tools[1]["input_schema"]["required"], json!(["path"]));
+        assert_eq!(
+            result["tool_choice"],
+            json!({"type": "tool", "name": exec_chat_name.clone()})
+        );
+        assert_eq!(result["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(result["messages"][0]["role"], "user");
+        assert_eq!(result["messages"][1]["role"], "assistant");
+        assert_eq!(result["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(result["messages"][1]["content"][0]["name"], exec_chat_name);
+        assert_eq!(result["messages"][2]["role"], "user");
+        assert_eq!(result["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            result["messages"][2]["content"][0]["tool_use_id"],
+            "call_previous"
+        );
+    }
+
+    #[test]
+    fn test_request_additional_tools_content_is_not_system_text() {
+        let input = json!({
+            "model": "claude-sonnet-5",
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "content": "INJECT",
+                "tools": []
+            }, {
+                "role": "user",
+                "content": "hello"
+            }]
+        });
+
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert!(result.get("system").is_none());
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(result["messages"][0]["role"], "user");
+    }
+
+    #[test]
     fn test_request_tool_choice_mapping() {
         // A function tool must be present, else tool_choice is (correctly) dropped.
         let base = |tc: Value| {
@@ -2598,6 +2709,40 @@ mod tests {
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["name"], "read");
         assert_eq!(response["output"][0]["namespace"], "mcp_files");
+    }
+
+    #[test]
+    fn test_response_restores_additional_namespace_custom_tool() {
+        let context = build_codex_tool_context_from_request(&json!({
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{"type": "custom", "name": "exec"}]
+                }]
+            }]
+        }));
+        let upstream_name = context.chat_name_for_response_custom("exec", Some("functions"));
+        let response = anthropic_response_to_responses_with_context(
+            json!({
+                "id": "msg_additional",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_exec",
+                    "name": upstream_name,
+                    "input": {"input": "pwd"}
+                }]
+            }),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(response["output"][0]["namespace"], "functions");
+        assert_eq!(response["output"][0]["name"], "exec");
+        assert_eq!(response["output"][0]["input"], "pwd");
     }
 
     #[test]

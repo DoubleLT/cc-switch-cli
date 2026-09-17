@@ -790,17 +790,15 @@ impl ChatToResponsesState {
 
             if is_custom_tool {
                 let input = custom_tool_input_from_chat_arguments(&arguments);
-                if !input.is_empty() {
-                    events.push(sse_event(
-                        "response.custom_tool_call_input.delta",
-                        json!({
-                            "type": "response.custom_tool_call_input.delta",
-                            "item_id": state.item_id,
-                            "output_index": output_index,
-                            "delta": input.clone()
-                        }),
-                    ));
-                }
+                events.push(sse_event(
+                    "response.custom_tool_call_input.delta",
+                    json!({
+                        "type": "response.custom_tool_call_input.delta",
+                        "item_id": state.item_id,
+                        "output_index": output_index,
+                        "delta": input.clone()
+                    }),
+                ));
                 events.push(sse_event(
                     "response.custom_tool_call_input.done",
                     json!({
@@ -1349,6 +1347,67 @@ mod tests {
         assert!(output.contains("\"type\":\"custom_tool_call\""));
         assert!(output.contains("\"name\":\"exec\""));
         assert!(output.contains("\"input\":\"ls -la\""));
+    }
+
+    #[tokio::test]
+    async fn restores_additional_namespace_custom_tool_stream_events() {
+        let request = json!({
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{"type": "custom", "name": "exec"}]
+                }]
+            }]
+        });
+        let context =
+            super::super::transform_codex_chat::build_codex_tool_context_from_request(&request);
+        let upstream_name = context.chat_name_for_response_custom("exec", Some("functions"));
+        let first = format!(
+            "data: {{\"id\":\"chatcmpl_additional\",\"model\":\"claude\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_exec\",\"type\":\"function\",\"function\":{{\"name\":\"{upstream_name}\"}}}}]}}}}]}}\n\n"
+        );
+        let output = collect_with_context(
+            vec![
+                &first,
+                "data: {\"id\":\"chatcmpl_additional\",\"model\":\"claude\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"input\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            context,
+        )
+        .await;
+
+        assert!(output.contains("event: response.output_item.added"));
+        assert!(output.contains("event: response.custom_tool_call_input.delta"));
+        assert!(output.contains("event: response.custom_tool_call_input.done"));
+        assert!(output.contains("event: response.output_item.done"));
+        assert!(output.contains("\"type\":\"custom_tool_call\""));
+        assert!(output.contains("\"namespace\":\"functions\""));
+        assert!(output.contains("\"name\":\"exec\""));
+        assert!(output.contains("\"input\":\"pwd\""));
+    }
+
+    #[tokio::test]
+    async fn custom_tool_empty_input_still_emits_delta_and_done() {
+        let request = json!({"tools": [{"type": "custom", "name": "exec"}]});
+        let context =
+            super::super::transform_codex_chat::build_codex_tool_context_from_request(&request);
+        let output = collect_with_context(
+            vec![
+                "data: {\"id\":\"chatcmpl_empty\",\"model\":\"claude\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_empty\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"input\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            context,
+        )
+        .await;
+        let events = parse_sse_events(&output);
+        assert!(events.iter().any(|event| {
+            event["type"] == "response.custom_tool_call_input.delta" && event["delta"] == ""
+        }));
+        assert!(events.iter().any(|event| {
+            event["type"] == "response.custom_tool_call_input.done" && event["input"] == ""
+        }));
     }
 
     #[tokio::test]
