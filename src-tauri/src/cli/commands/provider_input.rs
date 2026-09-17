@@ -777,6 +777,9 @@ mod tests {
     #[test]
     fn mask_api_key_never_returns_the_original_secret() {
         assert_eq!(mask_api_key("short"), "***");
+        assert_eq!(mask_api_key("123456789"), "***");
+        assert_eq!(mask_api_key("123456789012"), "***");
+        assert_eq!(mask_api_key("1234567890123456"), "***");
         assert_eq!(mask_api_key("sk-1234567890abcdef"), "sk-1...cdef");
         assert_ne!(mask_api_key("sk-1234567890abcdef"), "sk-1234567890abcdef");
     }
@@ -4294,8 +4297,8 @@ pub fn prompt_optional_fields(current: Option<&Provider>) -> Result<OptionalFiel
 }
 
 /// 显示供应商配置摘要
-fn mask_api_key(api_key: &str) -> String {
-    if api_key.chars().count() <= 8 {
+pub(super) fn mask_api_key(api_key: &str) -> String {
+    if api_key.chars().count() <= 16 {
         return "***".to_string();
     }
     let prefix = api_key.chars().take(4).collect::<String>();

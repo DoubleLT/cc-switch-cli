@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use super::provider_input::mask_api_key;
 use crate::app_config::AppType;
 use crate::cli::i18n::texts;
 use crate::cli::provider_quota::{
@@ -140,7 +141,11 @@ pub(crate) fn show_current(app_type: AppType) -> Result<(), AppError> {
         );
         println!(
             "  API Key:  {}",
-            config.api_key.unwrap_or_else(|| "N/A".to_string())
+            config
+                .api_key
+                .as_deref()
+                .map(mask_api_key)
+                .unwrap_or_else(|| "N/A".to_string())
         );
 
         println!("\n{}", highlight(texts::model_config_section_header()));
@@ -179,6 +184,8 @@ pub(crate) fn show_current(app_type: AppType) -> Result<(), AppError> {
             "  API Key:  {}",
             provider
                 .configured_api_key(&app_type)
+                .as_deref()
+                .map(mask_api_key)
                 .unwrap_or_else(|| "N/A".to_string())
         );
     }

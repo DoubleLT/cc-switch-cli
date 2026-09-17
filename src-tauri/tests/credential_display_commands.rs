@@ -31,9 +31,22 @@ fn assert_success(output: &Output) -> String {
     stdout
 }
 
+fn assert_secret_absent(output: &Output, secret: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains(secret),
+        "secret leaked to stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(secret),
+        "secret leaked to stderr:\n{stderr}"
+    );
+}
+
 #[test]
 #[serial]
-fn explicit_config_views_show_complete_credentials() {
+fn provider_current_masks_credentials() {
     let _lock = lock_test_mutex();
     reset_test_fs();
     let home = ensure_test_home();
@@ -56,17 +69,22 @@ fn explicit_config_views_show_complete_credentials() {
             "claude-sonnet-4-5",
         ],
     );
-    assert!(assert_success(&added).contains(provider_key));
+    let added = assert_success(&added);
+    assert!(added.contains("sk-p...3456"), "{added}");
+    assert!(!added.contains(provider_key), "{added}");
 
     assert_success(&run_cc_switch(
         home,
         &["provider", "switch", "plaintext-provider"],
     ));
-    let current = assert_success(&run_cc_switch(home, &["provider", "current"]));
-    assert!(current.contains(provider_key), "{current}");
+    let current_output = run_cc_switch(home, &["provider", "current"]);
+    assert_secret_absent(&current_output, provider_key);
+    let current = assert_success(&current_output);
+    assert!(current.contains("sk-p...3456"), "{current}");
+    assert!(!current.contains(provider_key), "{current}");
 
-    let preferred_claude_key = "sk-claude-selected-plaintext-123456";
-    let stale_claude_key = "sk-claude-stale-plaintext-123456";
+    let preferred_claude_key = "pref-claude-selected-plaintext-ABCD";
+    let stale_claude_key = "stale-claude-stale-plaintext-WXYZ";
     let claude_raw_config = format!(
         r#"{{"env":{{"ANTHROPIC_AUTH_TOKEN":"{stale_claude_key}","ANTHROPIC_API_KEY":"{preferred_claude_key}","ANTHROPIC_BASE_URL":"https://claude-fields.example.com"}}}}"#
     );
@@ -86,15 +104,22 @@ fn explicit_config_views_show_complete_credentials() {
         ],
     );
     let added = assert_success(&added);
-    assert!(added.contains(preferred_claude_key), "{added}");
+    assert!(added.contains("pref...ABCD"), "{added}");
+    assert!(!added.contains(preferred_claude_key), "{added}");
+    assert!(!added.contains("stal...WXYZ"), "{added}");
     assert!(!added.contains(stale_claude_key), "{added}");
 
     assert_success(&run_cc_switch(
         home,
         &["provider", "switch", "claude-preferred-field"],
     ));
-    let current = assert_success(&run_cc_switch(home, &["provider", "current"]));
-    assert!(current.contains(preferred_claude_key), "{current}");
+    let current_output = run_cc_switch(home, &["provider", "current"]);
+    assert_secret_absent(&current_output, preferred_claude_key);
+    assert_secret_absent(&current_output, stale_claude_key);
+    let current = assert_success(&current_output);
+    assert!(current.contains("pref...ABCD"), "{current}");
+    assert!(!current.contains(preferred_claude_key), "{current}");
+    assert!(!current.contains("stal...WXYZ"), "{current}");
     assert!(!current.contains(stale_claude_key), "{current}");
 
     let codex_key = "sk-codex-plaintext-123456";
@@ -117,17 +142,19 @@ fn explicit_config_views_show_complete_credentials() {
             "gpt-5.2-codex",
         ],
     );
-    assert!(assert_success(&added).contains(codex_key));
+    let added = assert_success(&added);
+    assert!(added.contains("sk-c...3456"), "{added}");
+    assert!(!added.contains(codex_key), "{added}");
 
     assert_success(&run_cc_switch(
         home,
         &["--app", "codex", "provider", "switch", "codex-plaintext"],
     ));
-    let current = assert_success(&run_cc_switch(
-        home,
-        &["--app", "codex", "provider", "current"],
-    ));
-    assert!(current.contains(codex_key), "{current}");
+    let current_output = run_cc_switch(home, &["--app", "codex", "provider", "current"]);
+    assert_secret_absent(&current_output, codex_key);
+    let current = assert_success(&current_output);
+    assert!(current.contains("sk-c...3456"), "{current}");
+    assert!(!current.contains(codex_key), "{current}");
 
     let codex_env_key = "sk-codex-env-plaintext-123456";
     let codex_env_config = serde_json::json!({
@@ -159,7 +186,9 @@ requires_openai_auth = true
             &codex_env_config,
         ],
     );
-    assert!(assert_success(&added).contains(codex_env_key));
+    let added = assert_success(&added);
+    assert!(added.contains("sk-c...3456"), "{added}");
+    assert!(!added.contains(codex_env_key), "{added}");
 
     assert_success(&run_cc_switch(
         home,
@@ -171,11 +200,11 @@ requires_openai_auth = true
             "codex-env-plaintext",
         ],
     ));
-    let current = assert_success(&run_cc_switch(
-        home,
-        &["--app", "codex", "provider", "current"],
-    ));
-    assert!(current.contains(codex_env_key), "{current}");
+    let current_output = run_cc_switch(home, &["--app", "codex", "provider", "current"]);
+    assert_secret_absent(&current_output, codex_env_key);
+    let current = assert_success(&current_output);
+    assert!(current.contains("sk-c...3456"), "{current}");
+    assert!(!current.contains(codex_env_key), "{current}");
 
     let codex_toml_key = "sk-codex-toml-plaintext-123456";
     let codex_toml_config = serde_json::json!({
@@ -209,7 +238,9 @@ experimental_bearer_token = "{codex_toml_key}"
             &codex_toml_config,
         ],
     );
-    assert!(assert_success(&added).contains(codex_toml_key));
+    let added = assert_success(&added);
+    assert!(added.contains("sk-c...3456"), "{added}");
+    assert!(!added.contains(codex_toml_key), "{added}");
 
     assert_success(&run_cc_switch(
         home,
@@ -221,11 +252,11 @@ experimental_bearer_token = "{codex_toml_key}"
             "codex-toml-plaintext",
         ],
     ));
-    let current = assert_success(&run_cc_switch(
-        home,
-        &["--app", "codex", "provider", "current"],
-    ));
-    assert!(current.contains(codex_toml_key), "{current}");
+    let current_output = run_cc_switch(home, &["--app", "codex", "provider", "current"]);
+    assert_secret_absent(&current_output, codex_toml_key);
+    let current = assert_success(&current_output);
+    assert!(current.contains("sk-c...3456"), "{current}");
+    assert!(!current.contains(codex_toml_key), "{current}");
 
     let usage_key = "sk-usage-plaintext-123456";
     assert_success(&run_cc_switch(
