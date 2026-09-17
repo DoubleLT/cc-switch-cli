@@ -16,6 +16,25 @@ use serial_test::serial;
 mod support;
 use support::{ensure_test_home, lock_test_mutex, reset_test_fs, state_from_config};
 
+struct ProviderKeyEnvGuard(Option<String>);
+
+impl ProviderKeyEnvGuard {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var("CC_SWITCH_PROVIDER_API_KEY").ok();
+        std::env::set_var("CC_SWITCH_PROVIDER_API_KEY", value);
+        Self(previous)
+    }
+}
+
+impl Drop for ProviderKeyEnvGuard {
+    fn drop(&mut self) {
+        match self.0.as_deref() {
+            Some(value) => std::env::set_var("CC_SWITCH_PROVIDER_API_KEY", value),
+            None => std::env::remove_var("CC_SWITCH_PROVIDER_API_KEY"),
+        }
+    }
+}
+
 /// Optional flags for [`add_command`]; mirrors the CLI `Add` variant so tests
 /// only spell out the fields they care about.
 #[derive(Default)]
@@ -165,6 +184,30 @@ fn add_claude_field_mode_defaults_to_auth_token() {
 
 #[test]
 #[serial]
+fn add_claude_accepts_api_key_from_environment() {
+    let _guard = lock_test_mutex();
+    prepare_empty_state();
+    let _key_guard = ProviderKeyEnvGuard::set("sk-from-environment");
+
+    run_add(
+        Some("Environment Key"),
+        AppType::Claude,
+        AddOpts {
+            base_url: Some("https://api.example.com".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("Claude add should read the provider key from the environment");
+
+    let provider = saved_provider(AppType::Claude, "environment-key");
+    assert_eq!(
+        env_str(&provider, "ANTHROPIC_AUTH_TOKEN"),
+        Some("sk-from-environment")
+    );
+}
+
+#[test]
+#[serial]
 fn add_claude_field_mode_accepts_every_model_role() {
     let _guard = lock_test_mutex();
     prepare_empty_state();
@@ -260,6 +303,37 @@ fn add_claude_missing_base_url_errors() {
         err.to_string().contains("--base-url"),
         "error should mention --base-url: {err}"
     );
+}
+
+#[test]
+#[serial]
+fn add_rejects_remote_plaintext_http_for_credentialed_providers() {
+    let _guard = lock_test_mutex();
+    prepare_empty_state();
+
+    let claude_error = run_add(
+        Some("Insecure Claude"),
+        AppType::Claude,
+        AddOpts {
+            base_url: Some("http://relay.example.com/v1".to_string()),
+            api_key: Some("sk-test".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect_err("remote Claude HTTP provider must be rejected");
+    assert!(claude_error.to_string().contains("HTTPS"));
+
+    let codex_error = run_add(
+        Some("Insecure Codex"),
+        AppType::Codex,
+        AddOpts {
+            base_url: Some("http://relay.example.com/v1".to_string()),
+            api_key: Some("sk-test".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect_err("remote Codex HTTP provider must be rejected");
+    assert!(codex_error.to_string().contains("HTTPS"));
 }
 
 #[test]
@@ -379,10 +453,14 @@ fn add_codex_anthropic_options_are_persisted() {
             base_url: Some("https://gateway.example/v1".to_string()),
             api_key: Some("sk-anthropic".to_string()),
             model: Some("claude-sonnet-4-6".to_string()),
-            api_format: Some("anthropic".to_string()),
+            api_format: Some("anthropic_messages".to_string()),
             api_key_field: Some(ClaudeApiKeyFieldArg::ApiKey),
             impersonate_claude_code: true,
             max_output_tokens: Some(16_384),
+            fable_model: Some("claude-fable-5-1".to_string()),
+            opus_model: Some("claude-opus-5".to_string()),
+            sonnet_model: Some("claude-sonnet-5".to_string()),
+            haiku_model: Some("claude-haiku-4-5-20251001".to_string()),
             ..Default::default()
         },
     )
@@ -394,6 +472,22 @@ fn add_codex_anthropic_options_are_persisted() {
     assert_eq!(meta.api_key_field.as_deref(), Some("ANTHROPIC_API_KEY"));
     assert_eq!(meta.impersonate_claude_code, Some(true));
     assert_eq!(meta.max_output_tokens, Some(16_384));
+    assert_eq!(
+        env_str(&provider, "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+        Some("claude-fable-5-1")
+    );
+    assert_eq!(
+        env_str(&provider, "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+        Some("claude-opus-5")
+    );
+    assert_eq!(
+        env_str(&provider, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+        Some("claude-sonnet-5")
+    );
+    assert_eq!(
+        env_str(&provider, "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        Some("claude-haiku-4-5-20251001")
+    );
     assert_eq!(
         provider
             .settings_config
@@ -412,6 +506,30 @@ fn add_codex_anthropic_options_are_persisted() {
 
 #[test]
 #[serial]
+fn add_codex_anthropic_requires_all_role_models() {
+    let _guard = lock_test_mutex();
+    prepare_empty_state();
+
+    let error = run_add(
+        Some("Incomplete Anthropic"),
+        AppType::Codex,
+        AddOpts {
+            base_url: Some("https://gateway.example/v1".to_string()),
+            api_key: Some("sk-anthropic".to_string()),
+            api_format: Some("anthropic".to_string()),
+            opus_model: Some("claude-opus-5".to_string()),
+            sonnet_model: Some("claude-sonnet-5".to_string()),
+            haiku_model: Some("claude-haiku-4-5-20251001".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect_err("Codex Anthropic provider with a missing role must be rejected");
+
+    assert!(error.to_string().contains("--fable-model"), "{error}");
+}
+
+#[test]
+#[serial]
 fn add_codex_raw_anthropic_config_preserves_upstream_format() {
     let _guard = lock_test_mutex();
     prepare_empty_state();
@@ -423,6 +541,12 @@ fn add_codex_raw_anthropic_config_preserves_upstream_format() {
             config: Some(
                 serde_json::json!({
                     "auth": {"OPENAI_API_KEY": "sk-anthropic"},
+                    "env": {
+                        "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5-20251001"
+                    },
                     "config": r#"model_provider = "vendor"
 model = "claude-sonnet-4-6"
 

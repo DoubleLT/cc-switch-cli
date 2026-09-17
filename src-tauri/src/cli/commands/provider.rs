@@ -1,5 +1,5 @@
 use clap::{Subcommand, ValueEnum};
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, net::IpAddr, path::PathBuf};
 
 use super::{provider_inspect, provider_usage_query};
 use crate::app_config::AppType;
@@ -1133,6 +1133,14 @@ impl AddProviderArgs {
     }
 }
 
+fn provider_api_key(args: &AddProviderArgs) -> Option<String> {
+    non_empty(args.api_key.clone()).or_else(|| {
+        std::env::var("CC_SWITCH_PROVIDER_API_KEY")
+            .ok()
+            .and_then(|value| non_empty(Some(value)))
+    })
+}
+
 /// Trim a flag value and drop it when empty.
 fn non_empty(value: Option<String>) -> Option<String> {
     value
@@ -1182,6 +1190,83 @@ fn add_claude_role_models_unsupported_error(app_type: &AppType) -> AppError {
             app_type.as_str()
         )
     })
+}
+
+fn validate_remote_transport_security(base_url: &str) -> Result<(), AppError> {
+    let parsed = reqwest::Url::parse(base_url).map_err(|error| {
+        AppError::InvalidInput(format!("invalid provider base URL '{base_url}': {error}"))
+    })?;
+    if parsed.scheme() != "http" {
+        return Ok(());
+    }
+
+    let host = parsed.host_str().unwrap_or_default();
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if is_loopback {
+        return Ok(());
+    }
+
+    Err(AppError::InvalidInput(
+        "remote provider base URLs must use HTTPS so API keys are not sent in plaintext"
+            .to_string(),
+    ))
+}
+
+fn validate_added_provider_transport(
+    app_type: &AppType,
+    provider: &Provider,
+) -> Result<(), AppError> {
+    let base_url = match app_type {
+        AppType::Claude => claude_current_base_url(Some(&provider.settings_config)),
+        AppType::Codex => codex_current_base_url_model(Some(&provider.settings_config)).0,
+        _ => None,
+    };
+    if let Some(base_url) = base_url {
+        validate_remote_transport_security(&base_url)?;
+    }
+    Ok(())
+}
+
+fn validate_codex_anthropic_role_models(
+    app_type: &AppType,
+    provider: &Provider,
+) -> Result<(), AppError> {
+    if !matches!(app_type, AppType::Codex)
+        || !crate::proxy::providers::codex_provider_uses_anthropic(provider)
+    {
+        return Ok(());
+    }
+
+    let env = provider.settings_config.get("env");
+    let required = [
+        ("--fable-model", ClaudeModelRole::Fable),
+        ("--opus-model", ClaudeModelRole::Opus),
+        ("--sonnet-model", ClaudeModelRole::Sonnet),
+        ("--haiku-model", ClaudeModelRole::Haiku),
+    ];
+    let missing = required
+        .into_iter()
+        .filter_map(|(flag, role)| {
+            let configured = env
+                .and_then(|value| value.get(role.model_env_key()))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            (!configured).then_some(flag)
+        })
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput(format!(
+            "Codex Anthropic providers require explicit role mappings: {}",
+            missing.join(", ")
+        )))
+    }
 }
 
 fn add_template_rejects_config_error(template: ProviderAddTemplate) -> AppError {
@@ -1326,7 +1411,14 @@ fn build_add_settings_config(
         return Ok(raw.clone());
     }
 
-    if !matches!(app_type, AppType::Claude) && args.has_claude_role_models() {
+    let codex_anthropic_mapping = matches!(app_type, AppType::Codex)
+        && args.api_format.as_deref().is_some_and(|format| {
+            validate_codex_api_format(format).ok() == Some(CLAUDE_API_FORMAT_ANTHROPIC)
+        });
+    if !matches!(app_type, AppType::Claude)
+        && !codex_anthropic_mapping
+        && args.has_claude_role_models()
+    {
         return Err(add_claude_role_models_unsupported_error(app_type));
     }
 
@@ -1335,8 +1427,8 @@ fn build_add_settings_config(
             let base_url = non_empty(args.base_url.clone())
                 .or_else(|| claude_current_base_url(current))
                 .ok_or_else(|| add_missing_field_error("--base-url"))?;
-            let api_key = non_empty(args.api_key.clone())
-                .ok_or_else(|| add_missing_field_error("--api-key"))?;
+            let api_key =
+                provider_api_key(args).ok_or_else(|| add_missing_field_error("--api-key"))?;
             let field = args.api_key_field.unwrap_or(ClaudeApiKeyField::AuthToken);
             let model_fields = args.claude_model_fields();
             let settings = build_claude_settings_config_from_prompt(
@@ -1358,20 +1450,36 @@ fn build_add_settings_config(
             let base_url = non_empty(args.base_url.clone())
                 .or(cur_base)
                 .ok_or_else(|| add_missing_field_error("--base-url"))?;
-            let api_key = non_empty(args.api_key.clone())
-                .ok_or_else(|| add_missing_field_error("--api-key"))?;
+            let api_key =
+                provider_api_key(args).ok_or_else(|| add_missing_field_error("--api-key"))?;
             let model = non_empty(args.model.clone())
                 .or(cur_model)
                 .unwrap_or_default();
-            Ok(build_codex_settings_config_from_prompt(
+            let mut settings = build_codex_settings_config_from_prompt(
                 current,
                 &api_key,
                 &base_url,
                 model.trim(),
                 provider_name,
-            ))
+            );
+            if codex_anthropic_mapping {
+                let env = settings
+                    .as_object_mut()
+                    .expect("Codex settings config must be an object")
+                    .entry("env")
+                    .or_insert_with(|| serde_json::json!({}));
+                let env = env
+                    .as_object_mut()
+                    .expect("Codex settings env must be an object");
+                for (key, value) in args.claude_model_fields() {
+                    if let Some(value) = value {
+                        env.insert(key.to_string(), serde_json::Value::String(value));
+                    }
+                }
+            }
+            Ok(settings)
         }
-        AppType::Gemini => match non_empty(args.api_key.clone()) {
+        AppType::Gemini => match provider_api_key(args) {
             Some(api_key) => {
                 let base_url = non_empty(args.base_url.clone())
                     .or_else(|| {
@@ -1389,7 +1497,7 @@ fn build_add_settings_config(
         },
         AppType::OpenCode | AppType::Hermes | AppType::OpenClaw => {
             let current = current.ok_or_else(|| add_additive_requires_config_error(app_type))?;
-            let api_key = non_empty(args.api_key.clone());
+            let api_key = provider_api_key(args);
             let base_url = non_empty(args.base_url.clone());
             let model = non_empty(args.model.clone());
             apply_additive_template_field_overrides(
@@ -1557,7 +1665,7 @@ fn add_provider(app_type: AppType, args: AddProviderArgs) -> Result<(), AppError
 
         let has_field_input = raw_config.is_some()
             || args.base_url.is_some()
-            || args.api_key.is_some()
+            || provider_api_key(&args).is_some()
             || args.model.is_some()
             || args.has_claude_role_models();
         if template.supports_field_overrides() {
@@ -1608,6 +1716,8 @@ fn add_provider(app_type: AppType, args: AddProviderArgs) -> Result<(), AppError
         args.account_id.as_deref(),
         args.fast_mode,
     )?;
+    validate_added_provider_transport(&app_type, &provider)?;
+    validate_codex_anthropic_role_models(&app_type, &provider)?;
 
     if supports_common_config(&app_type)
         && common_snippet_has_effective_config(&app_type, common_snippet.as_deref())

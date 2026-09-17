@@ -2077,6 +2077,77 @@ async fn codex_anthropic_prepare_request_rewrites_body_url_and_headers() {
 }
 
 #[tokio::test]
+async fn codex_anthropic_prepare_request_maps_codex_families_to_claude_roles() {
+    let mut provider = codex_anthropic_provider("https://gateway.example/v1", "claude-sonnet-5");
+    provider.settings_config["env"] = json!({
+        "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5-20251001"
+    });
+    let (_db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+
+    for (requested, expected) in [
+        ("gpt-6-astra", "claude-fable-5-1"),
+        ("gpt-5.6-sol", "claude-opus-5"),
+        ("gpt-5.6-terra", "claude-sonnet-5"),
+        ("gpt-5.6-luna", "claude-haiku-4-5-20251001"),
+    ] {
+        let request = forwarder
+            .prepare_request(
+                &AppType::Codex,
+                &provider,
+                "/v1/responses",
+                &json!({"model": requested, "input": "hello"}),
+                &HeaderMap::new(),
+                ForwardOptions {
+                    max_retries: 0,
+                    request_timeout: Some(Duration::from_secs(2)),
+                    bypass_circuit_breaker: true,
+                },
+            )
+            .await
+            .expect("prepare mapped Codex Anthropic request")
+            .build()
+            .expect("build mapped Codex Anthropic request");
+
+        assert_eq!(request_body_json(&request)["model"], expected);
+    }
+}
+
+#[tokio::test]
+async fn codex_responses_prepare_request_does_not_apply_claude_role_mapping() {
+    let mut provider = codex_provider("https://gateway.example/v1");
+    provider.settings_config["env"] = json!({
+        "ANTHROPIC_MODEL": "claude-sonnet-5",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5"
+    });
+    let (_db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+
+    let request = forwarder
+        .prepare_request(
+            &AppType::Codex,
+            &provider,
+            "/v1/responses",
+            &json!({"model": "gpt-5.6-sol", "input": "hello"}),
+            &HeaderMap::new(),
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(2)),
+                bypass_circuit_breaker: true,
+            },
+        )
+        .await
+        .expect("prepare Codex Responses request")
+        .build()
+        .expect("build Codex Responses request");
+
+    assert_eq!(request_body_json(&request)["model"], "gpt-5.6-sol");
+}
+
+#[tokio::test]
 async fn codex_anthropic_prepare_request_supports_x_api_key_impersonation_and_one_m() {
     let mut provider =
         codex_anthropic_provider("https://gateway.example/v1", "claude-sonnet-4-6[1m]");

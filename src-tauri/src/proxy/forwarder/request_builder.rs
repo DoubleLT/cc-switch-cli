@@ -13,7 +13,10 @@ use super::super::{
     error::ProxyError,
     http_client,
     json_canonical::canonicalize_value,
-    model_mapper::{apply_model_mapping, strip_one_m_suffix_for_upstream_from_body},
+    model_mapper::{
+        apply_codex_anthropic_model_mapping, apply_model_mapping,
+        strip_one_m_suffix_for_upstream_from_body,
+    },
     providers::{
         apply_codex_chat_upstream_model, apply_codex_upstream_model,
         claude_api_format_needs_transform, copilot_auth, get_adapter,
@@ -140,12 +143,22 @@ impl RequestForwarder {
         let is_full_url = provider_uses_full_url(provider);
         let is_copilot = is_claude_request
             && (provider.is_github_copilot() || base_url.contains("githubcopilot.com"));
-        let (mut mapped_body, _, _) = apply_model_mapping(body.clone(), provider);
         let codex_responses_to_chat = should_convert_codex_responses_to_chat(provider, endpoint)
             && matches!(app_type, AppType::Codex);
         let codex_responses_to_anthropic =
             should_convert_codex_responses_to_anthropic(provider, endpoint)
                 && matches!(app_type, AppType::Codex);
+        let (mut mapped_body, _, _) = if codex_responses_to_anthropic {
+            apply_codex_anthropic_model_mapping(body.clone(), provider)
+        } else if is_claude_request {
+            apply_model_mapping(body.clone(), provider)
+        } else {
+            (
+                body.clone(),
+                body.get("model").and_then(Value::as_str).map(String::from),
+                None,
+            )
+        };
 
         if is_claude_request && self.optimizer_config.enabled && is_bedrock_provider(provider) {
             if self.optimizer_config.thinking_optimizer {

@@ -224,6 +224,26 @@ fn codex_provider_catalog_model_ids(provider: &Provider) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+fn codex_provider_role_model_ids(provider: &Provider) -> HashSet<String> {
+    provider
+        .settings_config
+        .get("env")
+        .and_then(|env| env.as_object())
+        .map(|env| {
+            env.iter()
+                .filter(|(key, _)| {
+                    key.as_str() == "ANTHROPIC_MODEL"
+                        || key.starts_with("ANTHROPIC_DEFAULT_") && key.ends_with("_MODEL")
+                })
+                .filter_map(|(_, value)| value.as_str())
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// For Codex Chat providers, ensure the request uses the configured upstream
 /// model before converting the request to Chat Completions.
 pub fn apply_codex_chat_upstream_model(
@@ -241,13 +261,14 @@ pub fn apply_codex_chat_upstream_model(
 /// The Anthropic bridge calls this after routing has already been resolved.
 pub fn apply_codex_upstream_model(provider: &Provider, body: &mut JsonValue) -> Option<String> {
     let catalog_model_ids = codex_provider_catalog_model_ids(provider);
+    let role_model_ids = codex_provider_role_model_ids(provider);
     if let Some(request_model) = body
         .get("model")
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
-        if catalog_model_ids.contains(request_model) {
+        if catalog_model_ids.contains(request_model) || role_model_ids.contains(request_model) {
             return Some(request_model.to_string());
         }
     }
@@ -996,6 +1017,22 @@ wire_api = "chat"
 
         assert_eq!(upstream_model.as_deref(), Some("deepseek-reasoner"));
         assert_eq!(body["model"], "deepseek-reasoner");
+    }
+
+    #[test]
+    fn test_apply_codex_upstream_model_preserves_role_mapping_target() {
+        let provider = create_provider(json!({
+            "config": "model = \"gpt-5.6-sol\"",
+            "env": {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5"
+            }
+        }));
+        let mut body = json!({"model": "claude-opus-5", "input": "hello"});
+
+        let upstream_model = apply_codex_upstream_model(&provider, &mut body);
+
+        assert_eq!(upstream_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(body["model"], "claude-opus-5");
     }
 
     #[test]

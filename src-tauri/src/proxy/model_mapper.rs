@@ -89,6 +89,23 @@ impl ModelMapping {
 
         original_model.to_string()
     }
+
+    pub fn map_codex_model(&self, original_model: &str) -> String {
+        let model_lower = original_model.to_lowercase();
+        let family = model_lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .find(|token| matches!(*token, "astra" | "sol" | "terra" | "luna"));
+        let mapped = match family {
+            Some("astra") => self.fable_model.as_ref().or(self.opus_model.as_ref()),
+            Some("sol") => self.opus_model.as_ref(),
+            Some("terra") => self.sonnet_model.as_ref(),
+            Some("luna") => self.haiku_model.as_ref(),
+            _ => None,
+        };
+        mapped
+            .cloned()
+            .unwrap_or_else(|| self.map_model(original_model))
+    }
 }
 
 pub fn apply_model_mapping(
@@ -113,6 +130,22 @@ pub fn apply_model_mapping(
         }
     }
 
+    (body, original_model, None)
+}
+
+pub fn apply_codex_anthropic_model_mapping(
+    mut body: Value,
+    provider: &Provider,
+) -> (Value, Option<String>, Option<String>) {
+    let mapping = ModelMapping::from_provider(provider);
+    let original_model = body.get("model").and_then(Value::as_str).map(String::from);
+    if let Some(original) = &original_model {
+        let mapped = mapping.map_codex_model(original);
+        if mapped != *original {
+            body["model"] = serde_json::json!(mapped);
+            return (body, Some(original.clone()), Some(mapped));
+        }
+    }
     (body, original_model, None)
 }
 
@@ -211,6 +244,41 @@ mod tests {
 
         assert_eq!(result["model"], "fable-model");
         assert_eq!(mapped, Some("fable-model".to_string()));
+    }
+
+    #[test]
+    fn maps_codex_model_families_to_claude_roles() {
+        let provider = provider_with_env(json!({
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5-20251001"
+        }));
+
+        for (request, expected) in [
+            ("gpt-6-astra", "claude-fable-5-1"),
+            ("gpt-5.6-sol", "claude-opus-5"),
+            ("gpt-5.6-terra", "claude-sonnet-5"),
+            ("gpt-5.6-luna", "claude-haiku-4-5-20251001"),
+        ] {
+            let (result, _, mapped) =
+                apply_codex_anthropic_model_mapping(json!({"model": request}), &provider);
+            assert_eq!(result["model"], expected);
+            assert_eq!(mapped.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn codex_family_matching_requires_a_complete_token() {
+        let provider = provider_with_env(json!({
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5"
+        }));
+        for request in ["gpt-solar", "console-model", "absolute-model"] {
+            let (result, _, mapped) =
+                apply_codex_anthropic_model_mapping(json!({"model": request}), &provider);
+            assert_eq!(result["model"], request);
+            assert!(mapped.is_none());
+        }
     }
 
     #[test]
