@@ -12,7 +12,7 @@ import subprocess
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 APP_LABELS = {
@@ -26,7 +26,33 @@ class RejectRedirects(HTTPRedirectHandler):
         return None
 
 
-NO_REDIRECT_OPENER = build_opener(RejectRedirects)
+class ForcedProxyHandler(ProxyHandler):
+    def proxy_open(self, req, proxy, proxy_type):
+        marker = "__cc_switch_force_proxy__"
+        saved = {
+            name: os.environ.get(name)
+            for name in ("NO_PROXY", "no_proxy")
+        }
+        os.environ["NO_PROXY"] = marker
+        os.environ["no_proxy"] = marker
+        try:
+            return super().proxy_open(req, proxy, proxy_type)
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def build_model_opener():
+    proxy_url = os.environ.get("CC_SWITCH_PROVIDER_PROXY", "").strip()
+    handlers = [RejectRedirects()]
+    if proxy_url:
+        handlers.insert(
+            0, ForcedProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    return build_opener(*handlers)
 
 
 def fail(message):
@@ -420,6 +446,7 @@ def preferred_auth_modes(configs):
 def fetch_models(base_url, api_key, auth_modes, timeout=20):
     endpoint = model_endpoint(base_url)
     errors = []
+    opener = build_model_opener()
     for auth_mode in auth_modes:
         headers = {
             "Accept": "application/json",
@@ -431,7 +458,7 @@ def fetch_models(base_url, api_key, auth_modes, timeout=20):
             headers["x-api-key"] = api_key
             headers["anthropic-version"] = "2023-06-01"
         try:
-            with NO_REDIRECT_OPENER.open(
+            with opener.open(
                 Request(endpoint, headers=headers), timeout=timeout
             ) as response:
                 payload = json_load_response(response)
