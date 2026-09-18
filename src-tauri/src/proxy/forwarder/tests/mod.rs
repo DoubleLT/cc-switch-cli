@@ -56,6 +56,8 @@ struct DelayedScriptedUpstream {
 #[derive(Clone)]
 enum ScriptedStreamingBody {
     Json(Value),
+    RawJson(Bytes),
+    EncodedJson(Bytes, &'static str),
     Sse(&'static str),
     OwnedSse(String),
     Chunks(Vec<Bytes>),
@@ -209,6 +211,17 @@ async fn handle_scripted_streaming_upstream(
 
     match body {
         ScriptedStreamingBody::Json(body) => (status, Json(body)).into_response(),
+        ScriptedStreamingBody::RawJson(body) => Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("build raw JSON response"),
+        ScriptedStreamingBody::EncodedJson(body, encoding) => Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .header("content-encoding", encoding)
+            .body(Body::from(body))
+            .expect("build encoded JSON response"),
         ScriptedStreamingBody::Sse(body) => Response::builder()
             .status(status)
             .header("content-type", "text/event-stream")
@@ -273,6 +286,17 @@ async fn handle_delayed_scripted_streaming_upstream(
 
     match body {
         ScriptedStreamingBody::Json(body) => (status, Json(body)).into_response(),
+        ScriptedStreamingBody::RawJson(body) => Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("build delayed raw JSON response"),
+        ScriptedStreamingBody::EncodedJson(body, encoding) => Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .header("content-encoding", encoding)
+            .body(Body::from(body))
+            .expect("build delayed encoded JSON response"),
         ScriptedStreamingBody::Sse(body) => Response::builder()
             .status(status)
             .header("content-type", "text/event-stream")

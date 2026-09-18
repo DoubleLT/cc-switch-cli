@@ -1,8 +1,9 @@
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use futures::{stream::BoxStream, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -46,6 +47,7 @@ const RESPONSES_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RESPONSES_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(4);
 const RESPONSES_SEMANTIC_RETRY_LIMIT: u32 = 3;
 const RESPONSES_RETRY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(90);
+const CODEX_ANTHROPIC_JSON_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 struct ResponsesRetryState {
     remaining: u32,
@@ -54,8 +56,8 @@ struct ResponsesRetryState {
 }
 
 impl ResponsesRetryState {
-    fn new(app_type: &AppType, configured_retries: u32) -> Self {
-        let remaining = if matches!(app_type, AppType::Claude) {
+    fn new(enabled: bool, configured_retries: u32) -> Self {
+        let remaining = if enabled {
             configured_retries.min(RESPONSES_SEMANTIC_RETRY_LIMIT)
         } else {
             0
@@ -65,6 +67,13 @@ impl ResponsesRetryState {
             used: 0,
             deadline_started_at: None,
         }
+    }
+
+    fn with_fallback_deadline(mut self) -> Self {
+        if self.remaining > 0 {
+            self.deadline_started_at = Some(Instant::now());
+        }
+        self
     }
 
     fn timeout_origin(&self, provider_started_at: Instant) -> Instant {
@@ -89,11 +98,7 @@ impl ResponsesRetryState {
             return Ok(false);
         }
 
-        let retry_started_at = if configured_timeout.is_some() {
-            provider_started_at
-        } else {
-            Instant::now()
-        };
+        let retry_started_at = provider_started_at;
         let deadline_started_at = *self.deadline_started_at.get_or_insert(retry_started_at);
         let delay = responses_retry_backoff(self.used);
         wait_for_responses_retry(
@@ -343,7 +348,11 @@ impl RequestForwarder {
         let mut attempted_providers = 0usize;
         let mut pending_upstream_response = None;
         let max_attempts = (options.max_retries as usize).saturating_add(1);
-        let mut responses_retry_state = ResponsesRetryState::new(app_type, options.max_retries);
+        let mut responses_retry_state =
+            ResponsesRetryState::new(matches!(app_type, AppType::Claude), options.max_retries);
+        let mut codex_anthropic_retry_state =
+            ResponsesRetryState::new(matches!(app_type, AppType::Codex), options.max_retries)
+                .with_fallback_deadline();
 
         for provider in providers {
             if attempted_providers >= max_attempts {
@@ -370,6 +379,11 @@ impl RequestForwarder {
             pending_upstream_response = None;
             let provider_needs_transform = matches!(app_type, AppType::Claude)
                 && get_adapter(app_type).needs_transform(&provider);
+            let retry_state = if uses_codex_anthropic_protocol(app_type, &provider, endpoint) {
+                &mut codex_anthropic_retry_state
+            } else {
+                &mut responses_retry_state
+            };
             match self
                 .send_streaming_request(
                     app_type,
@@ -381,7 +395,7 @@ impl RequestForwarder {
                         max_retries: 0,
                         ..options
                     },
-                    &mut responses_retry_state,
+                    retry_state,
                     &rectifier_config,
                 )
                 .await
@@ -589,7 +603,11 @@ impl RequestForwarder {
         let mut attempted_providers = 0usize;
         let mut pending_upstream_response = None;
         let max_attempts = (options.max_retries as usize).saturating_add(1);
-        let mut responses_retry_state = ResponsesRetryState::new(app_type, options.max_retries);
+        let mut responses_retry_state =
+            ResponsesRetryState::new(matches!(app_type, AppType::Claude), options.max_retries);
+        let mut codex_anthropic_retry_state =
+            ResponsesRetryState::new(matches!(app_type, AppType::Codex), options.max_retries)
+                .with_fallback_deadline();
 
         for provider in providers {
             if attempted_providers >= max_attempts {
@@ -616,6 +634,11 @@ impl RequestForwarder {
             pending_upstream_response = None;
             let provider_needs_transform = matches!(app_type, AppType::Claude)
                 && get_adapter(app_type).needs_transform(&provider);
+            let retry_state = if uses_codex_anthropic_protocol(app_type, &provider, endpoint) {
+                &mut codex_anthropic_retry_state
+            } else {
+                &mut responses_retry_state
+            };
 
             match self
                 .send_buffered_request(
@@ -628,7 +651,7 @@ impl RequestForwarder {
                         max_retries: 0,
                         ..options
                     },
-                    &mut responses_retry_state,
+                    retry_state,
                     &rectifier_config,
                 )
                 .await
@@ -850,7 +873,9 @@ impl RequestForwarder {
             loop {
                 let request_timeout =
                     responses_retry_state.effective_timeout(options.request_timeout);
-                let attempt_started_at = if allow_transport_retry {
+                let attempt_started_at = if allow_transport_retry
+                    && responses_retry_state.deadline_started_at.is_none()
+                {
                     Instant::now()
                 } else {
                     responses_retry_state.timeout_origin(provider_started_at)
@@ -888,21 +913,42 @@ impl RequestForwarder {
                             if uses_codex_anthropic_protocol(app_type, provider, endpoint)
                                 && response_is_json(&response)
                             {
-                                let buffered_response = read_streaming_error_response(
+                                let buffered_response = read_buffered_response(
                                     response,
                                     attempt_started_at,
-                                    request_timeout,
+                                    request_timeout.or(Some(RESPONSES_RETRY_FALLBACK_TIMEOUT)),
+                                    Some(CODEX_ANTHROPIC_JSON_BODY_LIMIT),
+                                    true,
                                 )
                                 .await
                                 .map_err(StreamingRequestError::AfterResponse)?;
-                                validate_codex_anthropic_success_body(&buffered_response.body)
-                                    .map_err(|error| {
-                                        if rectifier_retried {
-                                            StreamingRequestError::AfterResponse(error)
-                                        } else {
-                                            StreamingRequestError::BeforeResponse(error)
+                                if let Err(error) =
+                                    validate_codex_anthropic_success_body(&buffered_response.body)
+                                {
+                                    match responses_retry_state
+                                        .wait_to_retry(
+                                            &error,
+                                            provider_started_at,
+                                            options.request_timeout,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => continue,
+                                        Ok(false) => {}
+                                        Err(timeout_error) => {
+                                            return Err(if rectifier_retried {
+                                                StreamingRequestError::AfterResponse(timeout_error)
+                                            } else {
+                                                StreamingRequestError::BeforeResponse(timeout_error)
+                                            });
                                         }
-                                    })?;
+                                    }
+                                    return Err(if rectifier_retried {
+                                        StreamingRequestError::AfterResponse(error)
+                                    } else {
+                                        StreamingRequestError::BeforeResponse(error)
+                                    });
+                                }
                                 return Ok(StreamingAttemptOutcome {
                                     response: StreamingResponse::Buffered(buffered_response),
                                     attempt_decision: AttemptDecision::FatalStop,
@@ -913,6 +959,7 @@ impl RequestForwarder {
                                 attempt_started_at,
                                 request_timeout,
                                 uses_responses_protocol(app_type, provider, endpoint),
+                                uses_codex_anthropic_protocol(app_type, provider, endpoint),
                                 anthropic_request_uses_web_search(app_type, body),
                                 responses_retry_state.deadline_started_at.is_some(),
                             )
@@ -961,10 +1008,12 @@ impl RequestForwarder {
                         }
 
                         if should_buffer_streaming_error_response(app_type, response.status()) {
-                            let buffered_response = read_streaming_error_response(
+                            let buffered_response = read_buffered_response(
                                 response,
                                 attempt_started_at,
                                 request_timeout,
+                                None,
+                                true,
                             )
                             .await
                             .map_err(StreamingRequestError::AfterResponse)?;
@@ -1150,7 +1199,9 @@ impl RequestForwarder {
             loop {
                 let request_timeout =
                     responses_retry_state.effective_timeout(options.request_timeout);
-                let attempt_started_at = if allow_transport_retry {
+                let attempt_started_at = if allow_transport_retry
+                    && responses_retry_state.deadline_started_at.is_none()
+                {
                     Instant::now()
                 } else {
                     responses_retry_state.timeout_origin(provider_started_at)
@@ -1184,45 +1235,23 @@ impl RequestForwarder {
                     None => Ok(request.send().await),
                 } {
                     Ok(Ok(response)) => {
-                        let status = response.status();
-                        let mut response_headers = response.headers().clone();
-                        let response_body = match request_timeout {
-                            Some(request_timeout) => {
-                                let remaining_timeout =
-                                    request_timeout.saturating_sub(attempt_started_at.elapsed());
-                                if remaining_timeout.is_zero() {
-                                    return Err(BufferedRequestError::AfterResponse(
-                                        request_timeout_error(request_timeout),
-                                    ));
-                                }
-                                tokio::time::timeout(remaining_timeout, response.bytes())
-                                    .await
-                                    .map_err(|_| {
-                                        BufferedRequestError::AfterResponse(request_timeout_error(
-                                            request_timeout,
-                                        ))
-                                    })?
-                                    .map_err(|error| {
-                                        BufferedRequestError::AfterResponse(map_request_send_error(
-                                            error,
-                                            Some(request_timeout),
-                                        ))
-                                    })?
-                            }
-                            None => response.bytes().await.map_err(|error| {
-                                BufferedRequestError::AfterResponse(map_request_send_error(
-                                    error, None,
-                                ))
-                            })?,
+                        let body_limit = (response.status().is_success()
+                            && uses_codex_anthropic_protocol(app_type, provider, endpoint))
+                        .then_some(CODEX_ANTHROPIC_JSON_BODY_LIMIT);
+                        let body_timeout = if body_limit.is_some() {
+                            request_timeout.or(Some(RESPONSES_RETRY_FALLBACK_TIMEOUT))
+                        } else {
+                            request_timeout
                         };
-                        let response_body =
-                            decode_buffered_response_body(&mut response_headers, response_body);
-
-                        let buffered_response = BufferedResponse {
-                            status,
-                            headers: response_headers,
-                            body: response_body,
-                        };
+                        let buffered_response = read_buffered_response(
+                            response,
+                            attempt_started_at,
+                            body_timeout,
+                            body_limit,
+                            false,
+                        )
+                        .await
+                        .map_err(BufferedRequestError::AfterResponse)?;
 
                         if !buffered_response.status.is_success()
                             && uses_responses_protocol(app_type, provider, endpoint)
@@ -1272,14 +1301,33 @@ impl RequestForwarder {
                         if buffered_response.status.is_success()
                             && uses_codex_anthropic_protocol(app_type, provider, endpoint)
                         {
-                            validate_codex_anthropic_success_body(&buffered_response.body)
-                                .map_err(|error| {
-                                    if rectifier_retried {
-                                        BufferedRequestError::AfterResponse(error)
-                                    } else {
-                                        BufferedRequestError::BeforeResponse(error)
+                            if let Err(error) =
+                                validate_codex_anthropic_success_body(&buffered_response.body)
+                            {
+                                match responses_retry_state
+                                    .wait_to_retry(
+                                        &error,
+                                        provider_started_at,
+                                        options.request_timeout,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => continue,
+                                    Ok(false) => {}
+                                    Err(timeout_error) => {
+                                        return Err(if rectifier_retried {
+                                            BufferedRequestError::AfterResponse(timeout_error)
+                                        } else {
+                                            BufferedRequestError::BeforeResponse(timeout_error)
+                                        });
                                     }
-                                })?;
+                                }
+                                return Err(if rectifier_retried {
+                                    BufferedRequestError::AfterResponse(error)
+                                } else {
+                                    BufferedRequestError::BeforeResponse(error)
+                                });
+                            }
                         } else if buffered_response.status.is_success()
                             && uses_responses_protocol(app_type, provider, endpoint)
                         {
@@ -1513,6 +1561,7 @@ async fn prepare_success_streaming_response(
     started_at: Instant,
     request_timeout: Option<Duration>,
     validate_responses_semantics: bool,
+    validate_codex_anthropic_semantics: bool,
     validate_responses_until_terminal: bool,
     enforce_responses_total_timeout: bool,
 ) -> Result<LiveResponse, ProxyError> {
@@ -1523,6 +1572,15 @@ async fn prepare_success_streaming_response(
             request_timeout,
             validate_responses_until_terminal,
             enforce_responses_total_timeout,
+        )
+        .await;
+    }
+
+    if validate_codex_anthropic_semantics {
+        return validate_codex_anthropic_stream_start(
+            response,
+            started_at,
+            request_timeout.or(Some(RESPONSES_RETRY_FALLBACK_TIMEOUT)),
         )
         .await;
     }
@@ -1553,6 +1611,494 @@ async fn prepare_success_streaming_response(
 
     let replay = futures::stream::once(async move { Ok(first) }).chain(stream);
     Ok(LiveResponse::from_stream(status, headers, replay))
+}
+
+async fn validate_codex_anthropic_stream_start(
+    response: reqwest::Response,
+    started_at: Instant,
+    request_timeout: Option<Duration>,
+) -> Result<LiveResponse, ProxyError> {
+    const MAX_PRIME_BYTES: usize = 256 * 1024;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    if headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"))
+    {
+        return Err(malformed_anthropic_stream_error(
+            "Anthropic SSE response used content encoding despite an identity request",
+        ));
+    }
+    let mut stream = response.bytes_stream().boxed();
+    let mut replay_chunks = Vec::new();
+    let mut replay_bytes = 0usize;
+    let mut parse_buffer = String::new();
+    let mut utf8_remainder = Vec::new();
+    let mut validator = AnthropicStreamStartValidator::default();
+
+    loop {
+        let next = match request_timeout {
+            Some(timeout) => {
+                let remaining = timeout.saturating_sub(started_at.elapsed());
+                if remaining.is_zero() {
+                    return Err(stream_first_byte_timeout_error(timeout));
+                }
+                tokio::time::timeout(remaining, stream.next())
+                    .await
+                    .map_err(|_| stream_first_byte_timeout_error(timeout))?
+            }
+            None => stream.next().await,
+        };
+
+        let Some(chunk) = next else {
+            if !utf8_remainder.is_empty() {
+                return Err(empty_codex_anthropic_stream_error(
+                    "Anthropic stream ended with incomplete UTF-8 before producing output",
+                ));
+            }
+            if validator.inspect_sse_block(&parse_buffer)? {
+                return Ok(LiveResponse::from_stream(
+                    status,
+                    headers,
+                    futures::stream::iter(replay_chunks.into_iter().map(Ok)),
+                ));
+            }
+            if let Some(result) = inspect_anthropic_json_document(&parse_buffer) {
+                result?;
+                return Ok(LiveResponse::from_stream(
+                    status,
+                    headers,
+                    futures::stream::iter(replay_chunks.into_iter().map(Ok)),
+                ));
+            }
+            return Err(empty_codex_anthropic_stream_error(
+                "Anthropic stream ended before producing text, reasoning, or a tool call",
+            ));
+        };
+        let chunk = chunk.map_err(|error| {
+            ProxyError::ForwardFailed(format!(
+                "failed while validating Anthropic stream start: {error}"
+            ))
+        })?;
+        replay_bytes = replay_bytes.saturating_add(chunk.len());
+        if replay_bytes > MAX_PRIME_BYTES {
+            return Err(empty_codex_anthropic_stream_error(&format!(
+                "Anthropic stream exceeded {MAX_PRIME_BYTES} bytes before producing text, reasoning, or a complete tool call"
+            )));
+        }
+        append_utf8_strict(&mut parse_buffer, &mut utf8_remainder, &chunk)?;
+        replay_chunks.push(chunk);
+
+        while let Some(block) = super::sse::take_sse_block(&mut parse_buffer) {
+            if validator.inspect_sse_block(&block)? {
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                return Ok(LiveResponse::from_stream(status, headers, replay));
+            }
+        }
+    }
+}
+
+pub(crate) struct AnthropicStreamStartValidator {
+    blocks: HashMap<u64, AnthropicValidationBlock>,
+    seen_blocks: HashSet<u64>,
+    substantive_output: bool,
+    reject_empty_terminal: bool,
+    terminal_seen: bool,
+}
+
+impl Default for AnthropicStreamStartValidator {
+    fn default() -> Self {
+        Self {
+            blocks: HashMap::new(),
+            seen_blocks: HashSet::new(),
+            substantive_output: false,
+            reject_empty_terminal: true,
+            terminal_seen: false,
+        }
+    }
+}
+
+impl AnthropicStreamStartValidator {
+    pub(crate) fn for_streaming_conversion() -> Self {
+        Self::default()
+    }
+}
+
+enum AnthropicValidationBlock {
+    Text,
+    Thinking,
+    RedactedThinking,
+    ToolUse {
+        start_input: Value,
+        partial_json: String,
+    },
+}
+
+impl AnthropicStreamStartValidator {
+    pub(crate) fn inspect_sse_block(&mut self, raw: &str) -> Result<bool, ProxyError> {
+        let mut named_event = None;
+        let mut data_lines = Vec::new();
+        for line in raw.lines() {
+            if let Some(event) = super::sse::strip_sse_field(line, "event") {
+                named_event = Some(event.trim());
+            } else if let Some(data) = super::sse::strip_sse_field(line, "data") {
+                data_lines.push(data);
+            }
+        }
+
+        let named_event = named_event.filter(|event| !event.is_empty());
+        if data_lines.is_empty() {
+            if named_event == Some("error") {
+                return Err(malformed_anthropic_stream_error(
+                    "Anthropic error event did not contain JSON data",
+                ));
+            }
+            return Ok(false);
+        }
+
+        let value: Value = serde_json::from_str(&data_lines.join("\n")).map_err(|_| {
+            malformed_anthropic_stream_error("Anthropic SSE event contained invalid JSON data")
+        })?;
+        let data_event = value.get("type").and_then(Value::as_str);
+        if named_event.is_some() && data_event.is_some() && named_event != data_event {
+            return Err(malformed_anthropic_stream_error(
+                "Anthropic SSE event name did not match its JSON type",
+            ));
+        }
+        let event = named_event.or(data_event).unwrap_or("");
+
+        if self.terminal_seen {
+            return Err(malformed_anthropic_stream_error(
+                "Anthropic stream emitted an event after message_stop",
+            ));
+        }
+
+        if event == "error" || value.get("error").is_some_and(|error| !error.is_null()) {
+            let error = value.get("error").unwrap_or(&value);
+            let error_type = error
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream_error");
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .unwrap_or("Anthropic upstream emitted an error before output");
+            return Err(responses_upstream_error(error_type, message));
+        }
+
+        let substantive = match event {
+            "content_block_start" => self.start_block(&value),
+            "content_block_delta" => self.update_block(&value),
+            "content_block_stop" => self.stop_block(&value),
+            "message_stop" if !self.blocks.is_empty() => Err(malformed_anthropic_stream_error(
+                "Anthropic stream completed with an open content block",
+            )),
+            "message_stop" if !self.substantive_output && self.reject_empty_terminal => {
+                Err(empty_codex_anthropic_stream_error(
+                    "Anthropic stream completed without text, reasoning, or a complete tool call",
+                ))
+            }
+            "message_stop" => {
+                self.terminal_seen = true;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }?;
+        self.substantive_output |= substantive;
+        Ok(self.substantive_output)
+    }
+
+    fn start_block(&mut self, value: &Value) -> Result<bool, ProxyError> {
+        let index = anthropic_event_index(value)?;
+        if !self.seen_blocks.insert(index) {
+            return Err(malformed_anthropic_stream_error(
+                "Anthropic stream started the same content block twice",
+            ));
+        }
+        let block = value.get("content_block").ok_or_else(|| {
+            malformed_anthropic_stream_error("Anthropic content block start omitted content_block")
+        })?;
+        let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+            malformed_anthropic_stream_error("Anthropic content block start omitted its type")
+        })?;
+        let (state, substantive) = match block_type {
+            "text" => {
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    malformed_anthropic_stream_error("Anthropic text block omitted text")
+                })?;
+                (AnthropicValidationBlock::Text, !text.is_empty())
+            }
+            "thinking" => {
+                let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                (AnthropicValidationBlock::Thinking, !thinking.is_empty())
+            }
+            "redacted_thinking" => {
+                let data = block.get("data").and_then(Value::as_str).ok_or_else(|| {
+                    malformed_anthropic_stream_error(
+                        "Anthropic redacted thinking block omitted data",
+                    )
+                })?;
+                (AnthropicValidationBlock::RedactedThinking, !data.is_empty())
+            }
+            "tool_use" if valid_anthropic_tool_use_start(block) => (
+                AnthropicValidationBlock::ToolUse {
+                    start_input: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                    partial_json: String::new(),
+                },
+                false,
+            ),
+            "tool_use" => {
+                return Err(malformed_anthropic_stream_error(
+                    "Anthropic tool use omitted a valid id, name, or input object",
+                ));
+            }
+            _ => return Ok(false),
+        };
+        self.blocks.insert(index, state);
+        Ok(substantive)
+    }
+
+    fn update_block(&mut self, value: &Value) -> Result<bool, ProxyError> {
+        let index = anthropic_event_index(value)?;
+        let delta = value.get("delta").ok_or_else(|| {
+            malformed_anthropic_stream_error("Anthropic content block delta omitted delta")
+        })?;
+        let delta_type = delta.get("type").and_then(Value::as_str).ok_or_else(|| {
+            malformed_anthropic_stream_error("Anthropic content block delta omitted its type")
+        })?;
+        let block = self.blocks.get_mut(&index).ok_or_else(|| {
+            malformed_anthropic_stream_error(
+                "Anthropic content block delta arrived before its block start",
+            )
+        })?;
+        match (block, delta_type) {
+            (AnthropicValidationBlock::Text, "text_delta") => delta
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    malformed_anthropic_stream_error("Anthropic text delta omitted text")
+                }),
+            (AnthropicValidationBlock::Thinking, "thinking_delta") => delta
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map(|thinking| !thinking.is_empty())
+                .ok_or_else(|| {
+                    malformed_anthropic_stream_error("Anthropic thinking delta omitted thinking")
+                }),
+            (AnthropicValidationBlock::Thinking, "signature_delta") => delta
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(|_| false)
+                .ok_or_else(|| {
+                    malformed_anthropic_stream_error("Anthropic signature delta omitted signature")
+                }),
+            (AnthropicValidationBlock::ToolUse { partial_json, .. }, "input_json_delta") => {
+                let fragment = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        malformed_anthropic_stream_error(
+                            "Anthropic tool input delta omitted partial_json",
+                        )
+                    })?;
+                partial_json.push_str(fragment);
+                Ok(false)
+            }
+            (AnthropicValidationBlock::RedactedThinking, _) => {
+                Err(malformed_anthropic_stream_error(
+                    "Anthropic redacted thinking block emitted an unexpected delta",
+                ))
+            }
+            _ => Err(malformed_anthropic_stream_error(
+                "Anthropic content block delta did not match its block type",
+            )),
+        }
+    }
+
+    fn stop_block(&mut self, value: &Value) -> Result<bool, ProxyError> {
+        let index = anthropic_event_index(value)?;
+        let block = self.blocks.remove(&index).ok_or_else(|| {
+            malformed_anthropic_stream_error(
+                "Anthropic content block stopped before it was started",
+            )
+        })?;
+        let AnthropicValidationBlock::ToolUse {
+            start_input,
+            partial_json,
+        } = block
+        else {
+            return Ok(false);
+        };
+        let input = if partial_json.is_empty() {
+            start_input
+        } else {
+            serde_json::from_str(&partial_json).map_err(|_| {
+                malformed_anthropic_stream_error(
+                    "Anthropic tool input deltas did not form valid JSON",
+                )
+            })?
+        };
+        if !input.is_object() {
+            return Err(malformed_anthropic_stream_error(
+                "Anthropic tool input did not form a JSON object",
+            ));
+        }
+        Ok(true)
+    }
+}
+
+fn anthropic_event_index(value: &Value) -> Result<u64, ProxyError> {
+    value.get("index").and_then(Value::as_u64).ok_or_else(|| {
+        malformed_anthropic_stream_error("Anthropic content block event omitted a valid index")
+    })
+}
+
+fn append_utf8_strict(
+    buffer: &mut String,
+    remainder: &mut Vec<u8>,
+    new_bytes: &[u8],
+) -> Result<(), ProxyError> {
+    let mut combined = std::mem::take(remainder);
+    combined.extend_from_slice(new_bytes);
+    match std::str::from_utf8(&combined) {
+        Ok(valid) => buffer.push_str(valid),
+        Err(error) if error.error_len().is_none() => {
+            let valid = std::str::from_utf8(&combined[..error.valid_up_to()])
+                .expect("UTF-8 prefix before an incomplete code point is valid");
+            buffer.push_str(valid);
+            *remainder = combined[error.valid_up_to()..].to_vec();
+        }
+        Err(_) => {
+            return Err(malformed_anthropic_stream_error(
+                "Anthropic SSE stream contained invalid UTF-8",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn malformed_anthropic_stream_error(message: &str) -> ProxyError {
+    responses_upstream_error("service_unavailable_error", message)
+}
+
+fn inspect_anthropic_json_document(input: &str) -> Option<Result<(), ProxyError>> {
+    let value = serde_json::from_str::<Value>(input.trim()).ok()?;
+    if value.get("type").and_then(Value::as_str) == Some("error")
+        || value.get("error").is_some_and(|error| !error.is_null())
+    {
+        let error = value.get("error").unwrap_or(&value);
+        let error_type = error
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream_error");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .unwrap_or("Anthropic upstream emitted an error before output");
+        return Some(Err(responses_upstream_error(error_type, message)));
+    }
+    if value.get("type").and_then(Value::as_str) != Some("message")
+        || value.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return Some(Err(malformed_anthropic_stream_error(
+            "Anthropic JSON response was not an assistant message",
+        )));
+    }
+    let Some(content) = value.get("content").and_then(Value::as_array) else {
+        return Some(Err(malformed_anthropic_stream_error(
+            "Anthropic assistant message omitted its content array",
+        )));
+    };
+    let mut substantive = false;
+    for block in content {
+        let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+            malformed_anthropic_stream_error("Anthropic content block omitted its type")
+        });
+        let Ok(block_type) = block_type else {
+            return Some(Err(block_type.unwrap_err()));
+        };
+        match block_type {
+            "tool_use" => {
+                if !valid_anthropic_tool_use(block) {
+                    return Some(Err(malformed_anthropic_stream_error(
+                        "Anthropic tool use omitted a valid id, name, or input object",
+                    )));
+                }
+                substantive = true;
+            }
+            "text" => {
+                let Some(text) = block.get("text").and_then(Value::as_str) else {
+                    return Some(Err(malformed_anthropic_stream_error(
+                        "Anthropic text block omitted text",
+                    )));
+                };
+                substantive |= !text.is_empty();
+            }
+            "thinking" => {
+                let Some(thinking) = block.get("thinking").and_then(Value::as_str) else {
+                    return Some(Err(malformed_anthropic_stream_error(
+                        "Anthropic thinking block omitted thinking",
+                    )));
+                };
+                substantive |= !thinking.is_empty();
+            }
+            "redacted_thinking" => {
+                let Some(data) = block.get("data").and_then(Value::as_str) else {
+                    return Some(Err(malformed_anthropic_stream_error(
+                        "Anthropic redacted thinking block omitted data",
+                    )));
+                };
+                substantive |= !data.is_empty();
+            }
+            _ => {
+                if !block.is_object() {
+                    return Some(Err(malformed_anthropic_stream_error(
+                        "Anthropic content block was not an object",
+                    )));
+                }
+            }
+        }
+    }
+    Some(if substantive {
+        Ok(())
+    } else {
+        Err(empty_codex_anthropic_stream_error(
+            "Anthropic response completed without text, reasoning, or a tool call",
+        ))
+    })
+}
+
+fn empty_codex_anthropic_stream_error(message: &str) -> ProxyError {
+    responses_upstream_error("service_unavailable_error", message)
+}
+
+fn valid_anthropic_tool_use(block: &Value) -> bool {
+    block
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
+        && block
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+        && block.get("input").is_some_and(Value::is_object)
+}
+
+fn valid_anthropic_tool_use_start(block: &Value) -> bool {
+    block
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        && block
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+        && block.get("input").is_none_or(Value::is_object)
 }
 
 async fn validate_responses_stream_start(
@@ -1716,28 +2262,16 @@ fn validate_buffered_responses_body(body: &[u8]) -> Result<(), ProxyError> {
 }
 
 fn validate_codex_anthropic_success_body(body: &[u8]) -> Result<(), ProxyError> {
-    if let Some(message) = codex_anthropic_error_envelope_message(body) {
-        return Err(ProxyError::TransformError(format!(
-            "Anthropic upstream returned a 2xx error envelope: {message}"
-        )));
-    }
-    Ok(())
-}
-
-fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("error") && value.get("error").is_none() {
-        return None;
-    }
-    let error = value.get("error").unwrap_or(&value);
-    let error_type = error.get("type").and_then(Value::as_str).unwrap_or("error");
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string());
-    Some(format!("{error_type}: {message}"))
+    let text = std::str::from_utf8(body).map_err(|_| {
+        empty_codex_anthropic_stream_error(
+            "Anthropic returned a non-UTF-8 2xx body before producing output",
+        )
+    })?;
+    inspect_anthropic_json_document(text).unwrap_or_else(|| {
+        Err(empty_codex_anthropic_stream_error(
+            "Anthropic returned an empty or invalid JSON 2xx body before producing output",
+        ))
+    })
 }
 
 fn responses_error_envelope(body: &[u8]) -> Option<(String, String)> {
@@ -1966,37 +2500,90 @@ async fn wait_for_responses_retry(
     Ok(())
 }
 
-async fn read_streaming_error_response(
+async fn read_buffered_response(
     response: reqwest::Response,
     started_at: Instant,
     request_timeout: Option<Duration>,
+    max_body_bytes: Option<usize>,
+    use_stream_timeout_error: bool,
 ) -> Result<BufferedResponse, ProxyError> {
     let status = response.status();
     let mut headers = response.headers().clone();
-    let body = match request_timeout {
-        Some(request_timeout) => {
-            let remaining_timeout = request_timeout.saturating_sub(started_at.elapsed());
-            if remaining_timeout.is_zero() {
-                return Err(stream_first_byte_timeout_error(request_timeout));
-            }
-
-            tokio::time::timeout(remaining_timeout, response.bytes())
-                .await
-                .map_err(|_| stream_first_byte_timeout_error(request_timeout))?
-                .map_err(|error| map_request_send_error(error, Some(request_timeout)))?
+    if max_body_bytes.is_some()
+        && headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"))
+    {
+        return Err(malformed_anthropic_stream_error(
+            "Anthropic JSON response used content encoding despite an identity request",
+        ));
+    }
+    if let (Some(limit), Some(content_length)) = (max_body_bytes, response.content_length()) {
+        if content_length > limit as u64 {
+            return Err(codex_anthropic_json_body_limit_error(limit));
         }
-        None => response
-            .bytes()
-            .await
-            .map_err(|error| map_request_send_error(error, None))?,
-    };
-    let body = decode_buffered_response_body(&mut headers, body);
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    loop {
+        let next = match request_timeout {
+            Some(request_timeout) => {
+                let remaining_timeout = request_timeout.saturating_sub(started_at.elapsed());
+                if remaining_timeout.is_zero() {
+                    return Err(buffered_read_timeout_error(
+                        request_timeout,
+                        use_stream_timeout_error,
+                    ));
+                }
+                tokio::time::timeout(remaining_timeout, stream.next())
+                    .await
+                    .map_err(|_| {
+                        buffered_read_timeout_error(request_timeout, use_stream_timeout_error)
+                    })?
+            }
+            None => stream.next().await,
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| map_request_send_error(error, request_timeout))?;
+        if let Some(limit) = max_body_bytes {
+            if body.len().saturating_add(chunk.len()) > limit {
+                return Err(codex_anthropic_json_body_limit_error(limit));
+            }
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = decode_buffered_response_body(&mut headers, Bytes::from(body));
+    if max_body_bytes.is_some_and(|limit| body.len() > limit) {
+        return Err(codex_anthropic_json_body_limit_error(
+            max_body_bytes.expect("body limit checked above"),
+        ));
+    }
 
     Ok(BufferedResponse {
         status,
         headers,
         body,
     })
+}
+
+fn codex_anthropic_json_body_limit_error(limit: usize) -> ProxyError {
+    empty_codex_anthropic_stream_error(&format!(
+        "Anthropic JSON response exceeded the {limit}-byte validation limit before client commit"
+    ))
+}
+
+fn buffered_read_timeout_error(
+    request_timeout: Duration,
+    use_stream_timeout_error: bool,
+) -> ProxyError {
+    if use_stream_timeout_error {
+        stream_first_byte_timeout_error(request_timeout)
+    } else {
+        request_timeout_error(request_timeout)
+    }
 }
 
 fn extract_upstream_error_message(body: &[u8]) -> Option<String> {

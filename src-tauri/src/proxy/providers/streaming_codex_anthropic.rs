@@ -20,6 +20,7 @@ use super::transform_codex_chat::{
     CodexToolContext,
 };
 use super::transform_responses::sanitize_anthropic_tool_use_input_json;
+use crate::proxy::forwarder::AnthropicStreamStartValidator;
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
@@ -62,6 +63,7 @@ struct AnthropicToResponsesState {
     anthropic_usage: Map<String, Value>,
     stop_reason: Option<String>,
     stream_truncated: bool,
+    terminal_requested: bool,
     tool_context: CodexToolContext,
 }
 
@@ -78,6 +80,7 @@ impl Default for AnthropicToResponsesState {
             anthropic_usage: Map::new(),
             stop_reason: None,
             stream_truncated: false,
+            terminal_requested: false,
             tool_context: CodexToolContext::default(),
         }
     }
@@ -565,7 +568,10 @@ fn process_anthropic_sse_block(
         "content_block_delta" => state.handle_content_block_delta(&data),
         "content_block_stop" => state.handle_content_block_stop(&data),
         "message_delta" => state.handle_message_delta(&data),
-        "message_stop" => state.finalize(),
+        "message_stop" => {
+            state.terminal_requested = true;
+            Vec::new()
+        }
         "error" => {
             let (message, error_type) = extract_anthropic_sse_error(&data);
             return (
@@ -579,6 +585,27 @@ fn process_anthropic_sse_block(
         _ => Vec::new(),
     };
     (events, false)
+}
+
+fn append_utf8_strict(
+    buffer: &mut String,
+    remainder: &mut Vec<u8>,
+    new_bytes: &[u8],
+) -> Result<(), &'static str> {
+    let mut combined = std::mem::take(remainder);
+    combined.extend_from_slice(new_bytes);
+    match std::str::from_utf8(&combined) {
+        Ok(valid) => buffer.push_str(valid),
+        Err(error) if error.error_len().is_none() => {
+            buffer.push_str(
+                std::str::from_utf8(&combined[..error.valid_up_to()])
+                    .expect("UTF-8 prefix before an incomplete code point is valid"),
+            );
+            *remainder = combined[error.valid_up_to()..].to_vec();
+        }
+        Err(_) => return Err("Anthropic SSE stream contained invalid UTF-8"),
+    }
+    Ok(())
 }
 
 fn json_document_candidate(input: &str) -> Option<&str> {
@@ -679,6 +706,7 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut state = AnthropicToResponsesState::with_tool_context(tool_context);
+        let mut validator = AnthropicStreamStartValidator::for_streaming_conversion();
         let mut stream_failed = false;
 
         tokio::pin!(stream);
@@ -686,13 +714,26 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    if let Err(message) = append_utf8_strict(&mut buffer, &mut utf8_remainder, &bytes) {
+                        if let Some(event) = state.failed_event(message.to_string(), Some("malformed_response".to_string())) {
+                            yield Ok(event);
+                        }
+                        stream_failed = true;
+                        break;
+                    }
 
                     // A few compatible gateways ignore stream:true and return one
                     // JSON document. Hold that body intact (including pretty-printed
                     // blank lines) until EOF instead of discarding it as SSE blocks.
                     if json_document_candidate(&buffer).is_none() {
                         while let Some(block) = take_sse_block(&mut buffer) {
+                            if let Err(error) = validator.inspect_sse_block(&block) {
+                                if let Some(event) = state.failed_event(error.to_string(), Some("malformed_response".to_string())) {
+                                    yield Ok(event);
+                                }
+                                stream_failed = true;
+                                break;
+                            }
                             let (events, failed) = process_anthropic_sse_block(&mut state, &block);
                             for event in events {
                                 yield Ok(event);
@@ -724,6 +765,15 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
         // Process a final event even when the upstream omitted the trailing blank
         // line. This is common with buffering reverse proxies and must not discard
         // the last delta or terminal message_stop.
+        if !stream_failed && !utf8_remainder.is_empty() {
+            if let Some(event) = state.failed_event(
+                "Anthropic SSE stream ended with incomplete UTF-8".to_string(),
+                Some("malformed_response".to_string()),
+            ) {
+                yield Ok(event);
+            }
+            stream_failed = true;
+        }
         if !stream_failed && !buffer.trim().is_empty() {
             if !state.response_started {
                 if let Some(candidate) = json_document_candidate(&buffer) {
@@ -739,6 +789,14 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                 }
             }
             if !state.completed {
+                if let Err(error) = validator.inspect_sse_block(&buffer) {
+                    if let Some(event) = state.failed_event(error.to_string(), Some("malformed_response".to_string())) {
+                        yield Ok(event);
+                    }
+                    stream_failed = true;
+                }
+            }
+            if !stream_failed && !state.completed {
                 let (events, failed) = process_anthropic_sse_block(&mut state, &buffer);
                 for event in events {
                     yield Ok(event);
@@ -748,7 +806,17 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
         }
 
         if !stream_failed && !state.completed {
-            if state.stop_reason.is_some() {
+            if state.terminal_requested && state.has_substantive_output() {
+                for event in state.finalize() {
+                    yield Ok(event);
+                }
+            } else if state.stop_reason.is_some() && state.has_substantive_output() {
+                if !state.blocks.is_empty() {
+                    // A stop reason does not complete an open content block. Keep a
+                    // partial tool payload from being presented as an executable call.
+                    state.stop_reason = Some("max_tokens".to_string());
+                    state.stream_truncated = true;
+                }
                 // message_delta (stop_reason + final usage) arrived but the stream ended
                 // before message_stop; the turn is semantically complete, finalize normally.
                 for event in state.finalize() {
@@ -1244,8 +1312,8 @@ mod tests {
             "data: {\"type\":\"error\",\"error\":{\"message\":\"late\"}}\n\n"
         );
         let merged = run(input).await;
-        assert_eq!(merged.matches("event: response.completed").count(), 1);
-        assert_eq!(merged.matches("event: response.failed").count(), 0);
+        assert_eq!(merged.matches("event: response.completed").count(), 0);
+        assert_eq!(merged.matches("event: response.failed").count(), 1);
     }
 
     #[tokio::test]

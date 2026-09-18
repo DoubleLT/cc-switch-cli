@@ -46,6 +46,7 @@ const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+const CODEX_EXEC_COMPATIBILITY_GUIDANCE: &str = "Codex exec compatibility: this is a JavaScript orchestration environment, not Node.js. The console global is unavailable, so never use console.log or console.error. Await nested tools through tools.*, then explicitly emit every result the model must receive with text(...), image(...), audio(...), or generatedImage(...). Awaiting a nested tool without one of those emitters returns no tool result.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
@@ -326,7 +327,10 @@ impl CodexToolContext {
                     original_name.clone()
                 }
             });
-        let description = json!(responses_custom_tool_description(tool));
+        let description = json!(responses_custom_tool_description(
+            tool,
+            namespace == Some("functions") && original_name == "exec",
+        ));
         let chat_tool = json!({
             "type": "function",
             "function": {
@@ -1345,8 +1349,12 @@ fn responses_tool_name(tool: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn responses_custom_tool_description(tool: &Value) -> String {
+fn responses_custom_tool_description(tool: &Value, is_codex_exec: bool) -> String {
     let mut description = String::new();
+    if is_codex_exec {
+        description.push_str(CODEX_EXEC_COMPATIBILITY_GUIDANCE);
+        description.push_str("\n\n");
+    }
     description.push_str(CUSTOM_TOOL_PRESERVED_METADATA_HEADING);
     description.push_str("\n```json\n");
     description.push_str(&serialize_tool_definition_for_description(tool));
@@ -2789,6 +2797,61 @@ mod tests {
             context.chat_tools()[0]["function"]["parameters"]["required"],
             json!(["current_path"])
         );
+    }
+
+    #[test]
+    fn additional_exec_tool_description_explains_codex_emission_semantics() {
+        let input = json!({
+            "tools": [{
+                "type": "custom",
+                "name": "exec",
+                "description": "A top-level custom tool with unrelated semantics"
+            }],
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Run JavaScript orchestration code"
+                    }]
+                }, {
+                    "type": "namespace",
+                    "name": "shell",
+                    "tools": [{
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Run a shell-specific command"
+                    }]
+                }]
+            }]
+        });
+
+        let context = build_codex_tool_context_from_request(&input);
+        let description_for = |namespace: Option<&str>| {
+            let chat_name = context.chat_name_for_response_custom("exec", namespace);
+            context
+                .chat_tools()
+                .iter()
+                .find(|tool| tool["function"]["name"] == chat_name)
+                .and_then(|tool| tool["function"]["description"].as_str())
+                .expect("custom exec description")
+        };
+        let description = description_for(Some("functions"));
+        let top_level_description = description_for(None);
+        let shell_description = description_for(Some("shell"));
+        assert_eq!(context.chat_tools().len(), 3);
+        assert!(top_level_description.contains("unrelated semantics"));
+        assert!(!top_level_description.contains("console global is unavailable"));
+        assert!(shell_description.contains("shell-specific command"));
+        assert!(!shell_description.contains("console global is unavailable"));
+        assert!(description.contains("console global is unavailable"));
+        assert!(description.contains("explicitly emit every result"));
+        assert!(description.contains("text(...)"));
+        assert!(description.contains(CUSTOM_TOOL_PRESERVED_METADATA_HEADING));
     }
 
     #[test]

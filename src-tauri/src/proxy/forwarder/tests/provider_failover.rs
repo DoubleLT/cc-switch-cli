@@ -993,7 +993,7 @@ async fn codex_anthropic_json_2xx_error_fails_over_before_provider_commit() {
         .expect("Anthropic 2xx error envelope should fail over");
 
     assert_eq!(result.provider.id, "p2");
-    assert_eq!(primary_hits.count.load(Ordering::SeqCst), 1);
+    assert_eq!(primary_hits.count.load(Ordering::SeqCst), 2);
     assert_eq!(secondary_hits.count.load(Ordering::SeqCst), 1);
 
     primary_server.abort();

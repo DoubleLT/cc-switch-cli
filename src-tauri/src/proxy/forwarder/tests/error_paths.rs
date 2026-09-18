@@ -1,4 +1,7 @@
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
@@ -6,13 +9,14 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::{
-    claude_provider, claude_request_body, closed_base_url, spawn_delayed_body_upstream,
-    spawn_delayed_scripted_streaming_upstream, spawn_delayed_scripted_upstream,
-    spawn_failing_body_upstream, spawn_mock_upstream, spawn_scripted_streaming_upstream,
-    test_router, ScriptedStreamingBody,
+    claude_provider, claude_request_body, closed_base_url, codex_provider,
+    spawn_delayed_body_upstream, spawn_delayed_scripted_streaming_upstream,
+    spawn_delayed_scripted_upstream, spawn_failing_body_upstream, spawn_mock_upstream,
+    spawn_scripted_streaming_upstream, test_router, ScriptedStreamingBody,
 };
 use crate::{
     app_config::AppType,
+    provider::ProviderMeta,
     proxy::{
         error::ProxyError,
         forwarder::{ForwardOptions, RequestForwarder, StreamingResponse},
@@ -20,6 +24,893 @@ use crate::{
         types::RectifierConfig,
     },
 };
+
+#[tokio::test]
+async fn codex_anthropic_empty_success_retries_before_client_commit() {
+    const EMPTY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    const SUCCESS: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![
+        (StatusCode::OK, ScriptedStreamingBody::Sse(EMPTY)),
+        (StatusCode::OK, ScriptedStreamingBody::Sse(SUCCESS)),
+    ])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 2,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("empty Anthropic completion should retry before client commit");
+
+    assert_eq!(result.response.status(), StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_empty_json_retries_before_client_commit() {
+    let empty = json!({
+        "id": "msg_empty",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 0}
+    });
+    let success = json!({
+        "id": "msg_ok",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![
+        (StatusCode::OK, ScriptedStreamingBody::Json(empty)),
+        (StatusCode::OK, ScriptedStreamingBody::Json(success)),
+    ])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 2,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("empty Anthropic JSON should retry before client commit");
+
+    assert_eq!(result.response.status(), StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_tool_use_commits_without_retry() {
+    const TOOL_USE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"exec\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"code\\\":\\\"text('ok')\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::Sse(TOOL_USE),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "run once", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 2,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("tool use should commit the first response without retrying");
+
+    let StreamingResponse::Live(response) = result.response else {
+        panic!("tool use should remain streaming");
+    };
+    let body = response
+        .bytes_stream()
+        .map(|chunk| chunk.expect("read tool-use response chunk"))
+        .collect::<Vec<_>>()
+        .await
+        .concat();
+    let body = String::from_utf8(body).expect("tool-use stream is utf-8");
+    assert!(body.contains("content_block_start"));
+    assert!(body.contains("input_json_delta"));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_empty_success_retry_exhaustion_returns_503() {
+    const EMPTY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![
+        (StatusCode::OK, ScriptedStreamingBody::Sse(EMPTY)),
+        (StatusCode::OK, ScriptedStreamingBody::Sse(EMPTY)),
+    ])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let error = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 1,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect_err("persistent empty Anthropic completions should fail explicitly");
+
+    match error {
+        ProxyError::UpstreamError { status, body } => {
+            assert_eq!(status, 503);
+            let body: Value = serde_json::from_str(body.as_deref().expect("error body"))
+                .expect("parse Anthropic error envelope");
+            assert_eq!(body["error"]["type"], "service_unavailable_error");
+            assert!(body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("without text")));
+        }
+        other => panic!("expected upstream 503, got {other:?}"),
+    }
+    assert_eq!(hits.count.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_empty_and_invalid_json_retry_before_client_commit() {
+    let success = json!({
+        "id": "msg_ok",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![
+        (StatusCode::OK, ScriptedStreamingBody::RawJson(Bytes::new())),
+        (
+            StatusCode::OK,
+            ScriptedStreamingBody::RawJson(Bytes::from_static(b"{\"type\":")),
+        ),
+        (StatusCode::OK, ScriptedStreamingBody::Json(success)),
+    ])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 2,
+                request_timeout: Some(Duration::from_secs(10)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("empty and truncated JSON should retry before client commit");
+
+    assert_eq!(result.response.status(), StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_redacted_thinking_is_substantive_output() {
+    const REDACTED: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_reasoning\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"encrypted-reasoning\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::Sse(REDACTED),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "reason", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 2,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("redacted thinking should be committed without retry");
+
+    let StreamingResponse::Live(response) = result.response else {
+        panic!("redacted thinking should remain streaming");
+    };
+    let body = response
+        .bytes_stream()
+        .map(|chunk| chunk.expect("read redacted-thinking response chunk"))
+        .collect::<Vec<_>>()
+        .await
+        .concat();
+    assert!(String::from_utf8(body)
+        .expect("redacted-thinking stream is utf-8")
+        .contains("encrypted-reasoning"));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[test]
+fn codex_anthropic_json_validation_handles_redacted_thinking_and_non_utf8() {
+    let redacted = serde_json::to_vec(&json!({
+        "id": "msg_reasoning",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "redacted_thinking", "data": "encrypted-reasoning"}]
+    }))
+    .expect("serialize redacted thinking response");
+    super::super::validate_codex_anthropic_success_body(&redacted)
+        .expect("redacted thinking is substantive output");
+
+    let error = super::super::validate_codex_anthropic_success_body(&[0xff])
+        .expect_err("non-UTF-8 success bodies must be rejected");
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+}
+
+#[tokio::test]
+async fn codex_anthropic_final_sse_block_without_separator_is_inspected() {
+    const TEXT_WITHOUT_SEPARATOR: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_text\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}"
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::Sse(TEXT_WITHOUT_SEPARATOR),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "reply", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("a final unterminated SSE block with output should remain valid");
+
+    assert_eq!(result.response.status(), StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_oversized_non_output_prelude_is_rejected() {
+    let oversized_comment = format!(
+        ":{}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"too late\"}}}}\n\n",
+        "x".repeat(256 * 1024)
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::OwnedSse(oversized_comment),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let error = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect_err("an oversized prelude without output must not be committed");
+
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_malformed_tool_use_is_rejected() {
+    const MALFORMED_TOOL: &str = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"\",\"name\":\"\",\"input\":null}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::Sse(MALFORMED_TOOL),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let error = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "run", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect_err("a malformed tool use must not be committed");
+
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[test]
+fn codex_anthropic_malformed_json_tool_use_is_rejected() {
+    let malformed = serde_json::to_vec(&json!({
+        "type": "message",
+        "content": [{"type": "tool_use", "id": "tool_1", "name": "exec"}]
+    }))
+    .expect("serialize malformed tool response");
+    let error = super::super::validate_codex_anthropic_success_body(&malformed)
+        .expect_err("a JSON tool use without an input object must be rejected");
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+}
+
+#[test]
+fn codex_anthropic_sse_validation_enforces_block_lifecycle_and_tool_json() {
+    let mut validator = super::super::AnthropicStreamStartValidator::default();
+    let orphan_delta = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"ignored\"}}"
+    );
+    assert!(validator.inspect_sse_block(orphan_delta).is_err());
+
+    let mut validator = super::super::AnthropicStreamStartValidator::default();
+    let tool_start = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",",
+        "\"name\":\"exec\",\"input\":{}}}"
+    );
+    let bad_delta = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{bad\"}}"
+    );
+    let tool_stop =
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}";
+    assert!(!validator
+        .inspect_sse_block(tool_start)
+        .expect("valid tool start"));
+    assert!(!validator
+        .inspect_sse_block(bad_delta)
+        .expect("tool JSON is incomplete until block stop"));
+    assert!(validator.inspect_sse_block(tool_stop).is_err());
+
+    let mut validator = super::super::AnthropicStreamStartValidator::default();
+    assert!(validator
+        .inspect_sse_block("event: error\ndata: {not-json}")
+        .is_err());
+}
+
+#[test]
+fn codex_anthropic_sse_validation_rejects_invalid_utf8() {
+    let mut buffer = String::new();
+    let mut remainder = Vec::new();
+    let error = super::super::append_utf8_strict(
+        &mut buffer,
+        &mut remainder,
+        b"data: {\"text\":\"\xff\"}\n\n",
+    )
+    .expect_err("invalid UTF-8 must not be replaced and accepted");
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+}
+
+#[tokio::test]
+async fn codex_anthropic_crlf_and_split_utf8_remain_streamable() {
+    let payload = concat!(
+        "event: content_block_start\r\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\n",
+        "event: content_block_delta\r\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\r\n\r\n"
+    );
+    let split = payload
+        .as_bytes()
+        .windows("你".len())
+        .position(|window| window == "你".as_bytes())
+        .expect("find multibyte text")
+        + 1;
+    let chunks = vec![
+        Bytes::copy_from_slice(&payload.as_bytes()[..split]),
+        Bytes::copy_from_slice(&payload.as_bytes()[split..]),
+    ];
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::Chunks(chunks),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "reply", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("CRLF and split UTF-8 should remain valid");
+
+    assert_eq!(result.response.status(), StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_oversized_json_is_rejected_before_commit() {
+    let oversized = Bytes::from(vec![b' '; 16 * 1024 * 1024 + 1]);
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::RawJson(oversized),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let error = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect_err("an oversized JSON body must not be buffered without a limit");
+
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_encoded_json_is_rejected_before_decompression() {
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![(
+        StatusCode::OK,
+        ScriptedStreamingBody::EncodedJson(Bytes::from_static(b"not-really-gzip"), "gzip"),
+    )])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let error = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect_err("encoded JSON must not bypass the decoded body limit");
+
+    assert!(matches!(
+        error,
+        ProxyError::UpstreamError { status: 503, .. }
+    ));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_json_overload_retries_with_503_semantics() {
+    let overload = json!({
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "busy"}
+    });
+    let success = json!({
+        "id": "msg_ok",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "ok"}]
+    });
+    let (base_url, hits, _bodies, server) = spawn_scripted_streaming_upstream(vec![
+        (StatusCode::OK, ScriptedStreamingBody::Json(overload)),
+        (StatusCode::OK, ScriptedStreamingBody::Json(success)),
+    ])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 1,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("a JSON overload envelope should retry and recover");
+
+    assert_eq!(result.response.status(), StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_anthropic_semantic_retry_shares_total_timeout() {
+    const EMPTY: &str = concat!(
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    const SUCCESS: &str = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n"
+    );
+    let (base_url, hits, _bodies, server) = spawn_delayed_scripted_streaming_upstream(vec![
+        (
+            Duration::ZERO,
+            StatusCode::OK,
+            ScriptedStreamingBody::Sse(EMPTY),
+        ),
+        (
+            Duration::from_millis(800),
+            StatusCode::OK,
+            ScriptedStreamingBody::Sse(SUCCESS),
+        ),
+    ])
+    .await;
+    let mut provider = codex_provider("p1", &base_url, false);
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    db.save_provider("codex", &provider)
+        .expect("save provider for health tracking");
+
+    let started = Instant::now();
+    let error = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 1,
+                request_timeout: Some(Duration::from_millis(1500)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect_err("semantic retries must share the configured total timeout");
+
+    assert!(matches!(error, ProxyError::Timeout(_)));
+    assert!(started.elapsed() < Duration::from_millis(1900));
+    assert_eq!(hits.count.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_native_responses_does_not_inherit_anthropic_retry_state() {
+    const NATIVE_FAILURE: &str = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"busy\"}}}\n\n"
+    );
+    const ANTHROPIC_SUCCESS: &str = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"
+    );
+    let (native_url, native_hits, _native_bodies, native_server) =
+        spawn_scripted_streaming_upstream(vec![(
+            StatusCode::OK,
+            ScriptedStreamingBody::Sse(NATIVE_FAILURE),
+        )])
+        .await;
+    let (anthropic_url, anthropic_hits, _anthropic_bodies, anthropic_server) =
+        spawn_scripted_streaming_upstream(vec![(
+            StatusCode::OK,
+            ScriptedStreamingBody::Sse(ANTHROPIC_SUCCESS),
+        )])
+        .await;
+    let native = codex_provider("native", &native_url, false);
+    let mut anthropic = codex_provider("anthropic", &anthropic_url, false);
+    anthropic.meta = Some(ProviderMeta {
+        api_format: Some("anthropic".to_string()),
+        ..Default::default()
+    });
+    let (db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+    for provider in [&native, &anthropic] {
+        db.save_provider("codex", provider)
+            .expect("save provider for health tracking");
+    }
+
+    let result = forwarder
+        .forward_response(
+            &AppType::Codex,
+            "/v1/responses",
+            json!({"model": "gpt-5.6-terra", "input": "continue", "stream": true}),
+            &HeaderMap::new(),
+            vec![native, anthropic],
+            ForwardOptions {
+                max_retries: 1,
+                request_timeout: Some(Duration::from_secs(5)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("native failure should fail over without an internal semantic retry");
+
+    assert_eq!(result.provider.id, "anthropic");
+    assert_eq!(native_hits.count.load(Ordering::SeqCst), 1);
+    assert_eq!(anthropic_hits.count.load(Ordering::SeqCst), 1);
+    native_server.abort();
+    anthropic_server.abort();
+}
 
 #[tokio::test]
 async fn single_provider_buffered_claude_non_2xx_returns_upstream_error() {
